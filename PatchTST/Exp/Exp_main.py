@@ -15,7 +15,7 @@ import time
 import warnings
 import matplotlib.pyplot as plt
 import numpy as np
-from model import Patch
+from PatchTST.model import Patch
 
 warnings.filterwarnings('ignore')
 

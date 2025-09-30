@@ -9,8 +9,8 @@ import torch.nn.functional as F
 import numpy as np
 
 #from collections import OrderedDict
-from layers.PatchTST_layers import *
-from layers.RevIN import RevIN
+from .PatchTST_layers import *
+from .RevIN import RevIN
 # Cell
 class PatchTST_backbone(nn.Module):
     def __init__(self, c_in:int, context_window:int, target_window:int, patch_len:int, stride:int, max_seq_len:Optional[int]=1024, 

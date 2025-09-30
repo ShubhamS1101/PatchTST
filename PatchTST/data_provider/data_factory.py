@@ -1,5 +1,5 @@
 from torch.utils.data import DataLoader
-from data_loader import Dataset_Custom, Dataset_Pred
+from .data_loader import Dataset_Custom, Dataset_Pred
 
 def data_provider(args, flag):
     """

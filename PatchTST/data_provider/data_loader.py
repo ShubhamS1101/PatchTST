@@ -1,4 +1,4 @@
-# updated data_loader.py
+# updated data_loader.
 from vmdpy import VMD  # ensure vmdpy is installed: pip install vmdpy
 import os
 import numpy as np
@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from utils.timefeatures import time_features
+from PatchTST.utils.time_features import time_features
 import warnings
 warnings.filterwarnings('ignore')
 

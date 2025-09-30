@@ -4,8 +4,8 @@ from typing import Optional
 import torch
 from torch import nn, Tensor
 
-from layers.PatchTST_backbone import PatchTST_backbone
-from layers.PatchTST_layers import series_decomp
+from PatchTST.layers.PatchTST_backbone import PatchTST_backbone
+from PatchTST.layers.PatchTST_layers import series_decomp
 
 
 # ---------------- AWSL ---------------- #

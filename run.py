@@ -2,7 +2,7 @@ import argparse
 import os
 import torch
 
-from PatchTST.exp.exp_main import Exp_Main
+from PatchTST.Exp.Exp_main import Exp_Main
 
 def main():
     parser = argparse.ArgumentParser(description='PatchTST + VMD + AWSL')

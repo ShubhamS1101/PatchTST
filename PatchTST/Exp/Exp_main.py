@@ -1,6 +1,5 @@
 from data_provider.data_factory import data_provider
-from exp.exp_basic import Exp_Basic
-from models import Informer, Autoformer, Transformer, DLinear, Linear, NLinear, PatchTST
+from Exp.Exp_basic import Exp_Basic
 from utils.tools import EarlyStopping, adjust_learning_rate, visual, test_params_flop
 from utils.metrics import metric
 
@@ -16,6 +15,7 @@ import time
 import warnings
 import matplotlib.pyplot as plt
 import numpy as np
+from model import Patch
 
 warnings.filterwarnings('ignore')
 
@@ -24,20 +24,11 @@ class Exp_Main(Exp_Basic):
         super(Exp_Main, self).__init__(args)
 
     def _build_model(self):
-        model_dict = {
-            'Autoformer': Autoformer,
-            'Transformer': Transformer,
-            'Informer': Informer,
-            'DLinear': DLinear,
-            'NLinear': NLinear,
-            'Linear': Linear,
-            'PatchTST': PatchTST,
-        }
-        model = model_dict[self.args.model].Model(self.args).float()
-
+        model = Patch.Model(self.args).float()
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
         return model
+
 
     def _get_data(self, flag):
         data_set, data_loader = data_provider(self.args, flag)

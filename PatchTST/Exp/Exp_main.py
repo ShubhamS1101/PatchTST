@@ -1,5 +1,5 @@
 from PatchTST.data_provider.data_factory import data_provider
-from Exp.Exp_basic import Exp_Basic
+from .Exp.Exp_basic import Exp_Basic
 from PatchTST.utils.tools import EarlyStopping, adjust_learning_rate, visual, test_params_flop
 from PatchTST.utils.metrics import metric
 

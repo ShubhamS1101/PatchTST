@@ -319,33 +319,68 @@ class Exp_Main(Exp_Basic):
         np.save(folder_path + 'pred.npy', preds)
         return
 
-    def predict(self, setting, load=False):
-        pred_data, pred_loader = self._get_data(flag='pred')
+    def predict(self, setting, load=True):
+        pred_folder = os.path.join('./results', setting, 'pred/')
+        os.makedirs(pred_folder, exist_ok=True)
 
         if load:
-            path = os.path.join(self.args.checkpoints, setting)
-            best_model_path = os.path.join(path, 'checkpoint.pth')
-            self.model.load_state_dict(torch.load(best_model_path))
-
-        preds = []
+            path = os.path.join(self.args.checkpoints, setting, 'checkpoint.pth')
+            self.model.load_state_dict(torch.load(path, map_location=self.device))
 
         self.model.eval()
+
+        preds_all = []
+        trues_all = []
+
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(pred_loader):
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(self.test_loader):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_y_mark = batch_y_mark.float().to(self.device)
 
-                outputs = self.model(batch_x)
-                outputs = outputs[:, -self.args.pred_len:, :]
-                outputs_np = outputs.detach().cpu().numpy()
-                preds.append(outputs_np)
+                outputs = self.model(batch_x, batch_x_mark, batch_y, batch_y_mark)
+            # outputs: [B, pred_len, num_imfs] (scaled IMF predictions)
 
-        preds = np.array(preds)
-        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
+            # -------- INVERSE TRANSFORM --------
+                if self.args.use_vmd:
+                    preds_imfs = []
+                    for imf_idx in range(outputs.shape[-1]):
+                        pred_imf = outputs[..., imf_idx].detach().cpu().numpy()
+                        pred_imf = self.scalers[imf_idx].inverse_transform(
+                            pred_imf.reshape(-1, 1)
+                        ).reshape(pred_imf.shape)  # back to rupees
+                        preds_imfs.append(pred_imf)
 
-        folder_path = './results/' + setting + '/'
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
+                    preds_denorm = np.stack(preds_imfs, axis=-1)  # [B, pred_len, num_imfs]
 
-        np.save(folder_path + 'real_prediction.npy', preds)
-        return
+                    if self.args.use_aswl:
+                    # get learned weights
+                        w = torch.softmax(self.model.aswl.weights, dim=0).detach().cpu().numpy()
+                        preds_final = np.tensordot(preds_denorm, w, axes=([-1], [0]))
+                        preds_final = preds_final[..., None]  # [B, pred_len, 1]
+                    else:
+                        preds_final = np.sum(preds_denorm, axis=-1, keepdims=True)
+
+                else:
+                # if not VMD, just inverse-transform whole series
+                    preds_final = self.scaler.inverse_transform(
+                        outputs.detach().cpu().numpy().reshape(-1, outputs.shape[-1])
+                    ).reshape(outputs.shape)
+
+                preds_all.append(preds_final)
+
+            # ground truth in rupees
+                true_y = batch_y[:, -self.args.pred_len:, -1].detach().cpu().numpy()
+                trues_all.append(true_y[..., None])
+  
+        preds_all = np.concatenate(preds_all, axis=0)
+        trues_all = np.concatenate(trues_all, axis=0)
+
+    # -------- SAVE --------
+        np.save(os.path.join(pred_folder, 'real_prediction.npy'), preds_all)
+        np.save(os.path.join(pred_folder, 'real_truth.npy'), trues_all)
+
+        logging.info(f"Saved predictions to {pred_folder}")
+        return preds_all, trues_all
+

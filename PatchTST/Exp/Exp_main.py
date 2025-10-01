@@ -31,7 +31,7 @@ class Exp_Main(Exp_Basic):
 
     def _get_data(self, flag):
         """Return dataset and dataloader for train/val/test/pred"""
-        data_set, data_loader = data_provider(self.args, flag)
+        data_set, data_loader, scaler = data_provider(self.args, flag)
         return data_set, data_loader
 
     def _select_optimizer(self):

@@ -8,7 +8,7 @@ from PatchTST.layers.PatchTST_backbone import PatchTST_backbone
 from PatchTST.layers.PatchTST_layers import series_decomp
 
 
-# ---------------- AWSL ---------------- #
+# ---------------- ASWL ---------------- #
 class ASWL(nn.Module):
     """Adaptive Scale-Weighted Layer"""
     def __init__(self, num_imfs: int):
@@ -134,26 +134,29 @@ class Model(nn.Module):
         if self.use_vmd and self.use_aswl:
             self.aswl = ASWL(self.num_imfs)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x_mark: Optional[Tensor] = None, *args, **kwargs) -> Tensor:
         """
-        x: [B, seq_len, C]
-           if use_vmd=True -> C=num_imfs (IMFs instead of original target)
+        Forward method accepts optional x_mark (time features) and ignores extra args/kwargs.
+        x: [B, seq_len, C]  (if use_vmd=True -> C=num_imfs)
         """
         # --- VMD + ASWL path --- #
         if self.use_vmd:
             # Expect x = [B, seq_len, num_imfs]
+            # convert to backbone expected shape [B, C, L] where C=num_imfs
             x = x.permute(0, 2, 1)        # -> [B, num_imfs, seq_len]
             preds = self.model(x)         # -> [B, num_imfs, pred_len]
             preds = preds.permute(0, 2, 1)  # -> [B, pred_len, num_imfs]
 
             if self.use_aswl:
-                # Weighted sum across IMFs -> final target prediction
+                # Weighted sum across IMFs -> final target prediction (still in scaled space)
                 preds = self.aswl(preds)   # -> [B, pred_len, 1]
             return preds
 
         # --- Decomposition path --- #
         elif hasattr(self, "decomp_module"):
+            # here x is original series with channels
             res_init, trend_init = self.decomp_module(x)
+            # decomp returns [B, C, L] style, match backbone expectations
             res_init, trend_init = res_init.permute(0, 2, 1), trend_init.permute(0, 2, 1)
             res = self.model_res(res_init)
             trend = self.model_trend(trend_init)
@@ -163,6 +166,7 @@ class Model(nn.Module):
 
         # --- Normal PatchTST --- #
         else:
+            # x: [B, seq_len, C] -> permute to [B, C, L] for backbone
             x = x.permute(0, 2, 1)  # [B, C, L]
             x = self.model(x)       # [B, C, pred_len]
             x = x.permute(0, 2, 1)  # [B, pred_len, C]

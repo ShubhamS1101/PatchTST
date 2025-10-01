@@ -43,6 +43,7 @@ def parse_args():
                         help='time features encoding; options: [timeF, fixed, learned]')
 
     parser.add_argument('--num_workers', type=int, default=0, help='num workers for data loading')
+    parser.add_argument('--individual', type=int, default=0, help='individual id for experiments, default=0')
 
     # Model
     parser.add_argument('--model', type=str, default='PatchTST', help='model name')

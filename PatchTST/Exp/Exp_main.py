@@ -2,7 +2,7 @@ from PatchTST.data_provider.data_factory import data_provider
 from .Exp_basic import Exp_Basic
 from PatchTST.utils.tools import EarlyStopping, adjust_learning_rate, visual, test_params_flop
 from PatchTST.utils.metrics import metric
-
+import joblib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,7 +22,10 @@ warnings.filterwarnings('ignore')
 class Exp_Main(Exp_Basic):
     def __init__(self, args):
         super(Exp_Main, self).__init__(args)
-
+        # placeholders for scalers that will be set during train or loaded in predict
+        self.scaler = None       # single scaler (non-vmd)
+        self.scalers = None      # dict/list of per-imf scalers (vmd)
+    
     def _build_model(self):
         """Build the PatchTST model (and wrap for multi-gpu if requested)."""
         model = Patch.Model(self.args).float()
@@ -31,7 +34,10 @@ class Exp_Main(Exp_Basic):
         return model
 
     def _get_data(self, flag):
-        """Return dataset, dataloader, and scaler (scaler=None if not provided)."""
+        """
+        Return dataset, dataloader, scaler.
+        scaler will be None if data_provider didn't return one.
+        """
         result = data_provider(self.args, flag)
         if len(result) == 3:
             data_set, data_loader, scaler = result
@@ -108,9 +114,17 @@ class Exp_Main(Exp_Basic):
         return total_loss
 
     def train(self, setting):
-        train_data, train_loader, _ = self._get_data(flag='train')
+        # get data and scalers for train/val/test
+        train_data, train_loader, train_scaler = self._get_data(flag='train')
         vali_data, vali_loader, _ = self._get_data(flag='val')
         test_data, test_loader, _ = self._get_data(flag='test')
+
+        # store scalers from training dataset for later inverse transform/save
+        if getattr(self.args, "use_vmd", False):
+            # train_scaler expected to be a dict/list of per-imf scalers
+            self.scalers = train_scaler
+        else:
+            self.scaler = train_scaler
 
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
@@ -123,9 +137,9 @@ class Exp_Main(Exp_Basic):
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
 
-        scaler = None
+        amp_scaler = None
         if getattr(self.args, "use_amp", False):
-            scaler = torch.cuda.amp.GradScaler()
+            amp_scaler = torch.cuda.amp.GradScaler()
 
         scheduler = lr_scheduler.OneCycleLR(
             optimizer=model_optim,
@@ -148,7 +162,7 @@ class Exp_Main(Exp_Basic):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
 
-                if scaler is not None:
+                if amp_scaler is not None:
                     with torch.cuda.amp.autocast():
                         outputs = self.model(batch_x)
                         outputs = outputs[:, -self.args.pred_len:, :]
@@ -172,10 +186,10 @@ class Exp_Main(Exp_Basic):
                     iter_count = 0
                     time_now = time.time()
 
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                    scaler.step(model_optim)
-                    scaler.update()
+                if amp_scaler is not None:
+                    amp_scaler.scale(loss).backward()
+                    amp_scaler.step(model_optim)
+                    amp_scaler.update()
                 else:
                     loss.backward()
                     model_optim.step()
@@ -201,11 +215,31 @@ class Exp_Main(Exp_Basic):
             else:
                 print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
 
+        # load best checkpoint (EarlyStopping wrote it to path)
         best_model_path = os.path.join(path, 'checkpoint.pth')
         if os.path.exists(best_model_path):
-            self.model.load_state_dict(torch.load(best_model_path))
+            self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
         else:
             print(f"[Warning] Best model checkpoint not found at {best_model_path}. Skipping load.")
+
+        # ------------------ SAVE SCALERS ------------------
+        # Save scalers so predict() can load them later. Save under ./results/<setting>/
+        save_dir = os.path.join('./results', setting)
+        os.makedirs(save_dir, exist_ok=True)
+
+        try:
+            if getattr(self.args, "use_vmd", False) and (self.scalers is not None):
+                # assume self.scalers is a dict or list-like of fitted scaler objects
+                for i, sc in enumerate(self.scalers):
+                    joblib.dump(sc, os.path.join(save_dir, f"scaler_imf{i}.pkl"))
+                print(f"✅ Saved {len(self.scalers)} IMF scalers to {save_dir}")
+            elif self.scaler is not None:
+                joblib.dump(self.scaler, os.path.join(save_dir, "scaler.pkl"))
+                print(f"✅ Saved single scaler to {save_dir}")
+            else:
+                print("[Info] No scaler object found to save.")
+        except Exception as e:
+            print(f"[Warning] Failed to save scalers: {e}")
 
         return self.model
 
@@ -214,7 +248,8 @@ class Exp_Main(Exp_Basic):
 
         if test:
             print('loading model')
-            self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth')))
+            self.model.load_state_dict(torch.load(os.path.join('./checkpoints/' + setting, 'checkpoint.pth'),
+                                                  map_location=self.device))
 
         preds = []
         trues = []
@@ -278,11 +313,36 @@ class Exp_Main(Exp_Basic):
         pred_folder = os.path.join('./results', setting, 'pred/')
         os.makedirs(pred_folder, exist_ok=True)
 
+        # ---- Load trained model ----
         if load:
             path = os.path.join(self.args.checkpoints, setting, 'checkpoint.pth')
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Checkpoint not found: {path}")
             self.model.load_state_dict(torch.load(path, map_location=self.device))
+
+        # ---- Ensure scalers are available: try to load from saved results folder
+        scalers_folder = os.path.join('./results', setting)
+        try:
+            if getattr(self.args, "use_vmd", False):
+                # load per-imf scalers
+                loaded = []
+                for i in range(int(self.args.num_imfs)):
+                    p = os.path.join(scalers_folder, f"scaler_imf{i}.pkl")
+                    if os.path.exists(p):
+                        loaded.append(joblib.load(p))
+                    else:
+                        loaded.append(None)
+                self.scalers = loaded
+                if any(s is None for s in loaded):
+                    logging.warning("Some IMF scaler files missing; inverse transform may be inaccurate.")
+            else:
+                p = os.path.join(scalers_folder, "scaler.pkl")
+                if os.path.exists(p):
+                    self.scaler = joblib.load(p)
+                else:
+                    logging.warning("No single scaler.pkl found for this setting.")
+        except Exception as e:
+            logging.warning(f"Failed to load scalers: {e}")
 
         self.model.eval()
         _, predict_loader, _ = self._get_data(flag="test")
@@ -293,39 +353,90 @@ class Exp_Main(Exp_Basic):
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(predict_loader):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
-                batch_x_mark = batch_x_mark.float().to(self.device)
-                batch_y_mark = batch_y_mark.float().to(self.device)
 
-                outputs = self.model(batch_x, batch_x_mark)
+                # ---- Forward pass (use same call as training) ----
+                outputs = self.model(batch_x)
+                outputs = outputs[:, -self.args.pred_len:, :]
 
-                if self.args.use_vmd:
-                    preds_imfs = []
-                    for imf_idx in range(outputs.shape[-1]):
-                        pred_imf = outputs[..., imf_idx].detach().cpu().numpy()
-                        pred_imf = self.scalers[imf_idx].inverse_transform(
-                            pred_imf.reshape(-1, 1)
-                        ).reshape(pred_imf.shape)
-                        preds_imfs.append(pred_imf)
-
-                    preds_denorm = np.stack(preds_imfs, axis=-1)
-                    if self.args.use_aswl:
-                        w = torch.softmax(self.model.aswl.weights, dim=0).detach().cpu().numpy()
-                        preds_final = np.tensordot(preds_denorm, w, axes=([-1], [0]))
-                        preds_final = preds_final[..., None]
+                # ---- Inverse transform / reconstruct into original units (rupees) ----
+                if getattr(self.args, "use_vmd", False):
+                    # outputs shape: [B, pred_len, num_imfs] (or if ASWL=True maybe [B, pred_len,1])
+                    if outputs.shape[-1] == 1 and getattr(self.args, "use_aswl", False):
+                        # already weighted sum (scaled). We expect a single-channel scaled prediction.
+                        # If single-channel, but scalers are IMF-wise, we cannot inverse per-imf — assume saved final scaled->raw mapping unavailable.
+                        # Best-effort: if train saved a single scaler (rare), use it; otherwise proceed without inverse.
+                        if self.scaler is not None:
+                            preds_final = self.scaler.inverse_transform(outputs.detach().cpu().numpy().reshape(-1, 1)).reshape(outputs.shape)
+                        else:
+                            # Try to reconstruct by inverse-transforming IMFs predicted earlier — but we don't have them if ASWL returned single channel.
+                            logging.warning("ASWL produced single-channel scaled output and no single scaler found; saving scaled outputs.")
+                            preds_final = outputs.detach().cpu().numpy()
                     else:
-                        preds_final = np.sum(preds_denorm, axis=-1, keepdims=True)
+                        # per-IMF outputs available: inverse each IMFs then sum or weight
+                        preds_imfs = []
+                        for imf_idx in range(outputs.shape[-1]):
+                            pred_imf = outputs[..., imf_idx].detach().cpu().numpy()
+                            sc = None
+                            if self.scalers is not None and imf_idx < len(self.scalers):
+                                sc = self.scalers[imf_idx]
+                            if sc is not None:
+                                pred_imf = sc.inverse_transform(pred_imf.reshape(-1, 1)).reshape(pred_imf.shape)
+                            else:
+                                logging.warning(f"No scaler for IMF {imf_idx}; keeping scaled values for that IMF.")
+                            preds_imfs.append(pred_imf)
+                        preds_denorm = np.stack(preds_imfs, axis=-1)  # [B, pred_len, num_imfs]
+                        if getattr(self.args, "use_aswl", False) and hasattr(self.model, "aswl"):
+                            w = torch.softmax(self.model.aswl.weights, dim=0).detach().cpu().numpy()
+                            preds_final = np.tensordot(preds_denorm, w, axes=([-1], [0]))  # [B, pred_len]
+                            preds_final = preds_final[..., None]
+                        else:
+                            preds_final = np.sum(preds_denorm, axis=-1, keepdims=True)
                 else:
-                    preds_final = self.scaler.inverse_transform(
-                        outputs.detach().cpu().numpy().reshape(-1, outputs.shape[-1])
-                    ).reshape(outputs.shape)
+                    # non-VMD case: use single scaler if available
+                    out_np = outputs.detach().cpu().numpy().reshape(-1, outputs.shape[-1])
+                    if self.scaler is not None:
+                        inv = self.scaler.inverse_transform(out_np)
+                        preds_final = inv.reshape(outputs.shape)
+                    else:
+                        logging.warning("No scaler found for non-VMD case; saving scaled outputs.")
+                        preds_final = outputs.detach().cpu().numpy()
 
                 preds_all.append(preds_final)
-                true_y = batch_y[:, -self.args.pred_len:, -1].detach().cpu().numpy()
-                trues_all.append(true_y[..., None])
+
+                # ---- Ground truth in original units where possible ----
+                # batch_y may be scaled; if we have scalers we can inverse-transform target similarly.
+                true_segment = batch_y[:, -self.args.pred_len:, :].detach().cpu().numpy()
+                # If VMD, true_segment are IMFs (scaled) -> inverse per-imf and sum.
+                if getattr(self.args, "use_vmd", False):
+                    try:
+                        trues_imfs = []
+                        for imf_idx in range(true_segment.shape[-1]):
+                            sc = None
+                            if self.scalers is not None and imf_idx < len(self.scalers):
+                                sc = self.scalers[imf_idx]
+                            col = true_segment[..., imf_idx]
+                            if sc is not None:
+                                inv_col = sc.inverse_transform(col.reshape(-1, 1)).reshape(col.shape)
+                            else:
+                                inv_col = col
+                            trues_imfs.append(inv_col)
+                        trues_denorm = np.stack(trues_imfs, axis=-1)
+                        trues_final = np.sum(trues_denorm, axis=-1, keepdims=True)
+                    except Exception:
+                        trues_final = true_segment[..., :1]  # fallback
+                else:
+                    if self.scaler is not None:
+                        flat = true_segment.reshape(-1, true_segment.shape[-1])
+                        trues_final = self.scaler.inverse_transform(flat).reshape(true_segment.shape)
+                    else:
+                        trues_final = true_segment
+
+                trues_all.append(trues_final)
 
         preds_all = np.concatenate(preds_all, axis=0)
         trues_all = np.concatenate(trues_all, axis=0)
 
+        # ---- Save outputs ----
         np.save(os.path.join(pred_folder, 'real_prediction.npy'), preds_all)
         np.save(os.path.join(pred_folder, 'real_truth.npy'), trues_all)
 

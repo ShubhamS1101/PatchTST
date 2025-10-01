@@ -21,6 +21,7 @@ def main():
     parser.add_argument('--label_len', type=int, default=48, help='start token length')
     parser.add_argument('--pred_len', type=int, default=1, help='prediction sequence length')
     parser.add_argument('--embed', type=str, default='timeF', help='time features encoding, options: [timeF, fixed, learned]')
+    parser.add_argument('--num_workers', type=int, default=0, help='number of workers for data loading')
 
     # Model
     parser.add_argument('--model', type=str, default='PatchTST', help='model name')

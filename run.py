@@ -29,7 +29,9 @@ def parse_args():
     parser.add_argument('--features', type=str, default='S', help='forecast task: [M, S, MS]')
     parser.add_argument('--target', type=str, default='close', help='target feature for S or MS')
     parser.add_argument('--freq', type=str, default='h', help='frequency for time features encoding')
-
+    parser.add_argument('--revin', type=int, default=1, help='RevIN; True 1 False 0')
+    parser.add_argument('--affine', type=int, default=0, help='RevIN-affine; True 1 False 0')
+    parser.add_argument('--subtract_last', type=int, default=0, help='0: subtract mean; 1: subtract last')
     # Checkpoints / saving
     parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
 

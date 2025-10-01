@@ -8,17 +8,17 @@ def main():
     parser = argparse.ArgumentParser(description='PatchTST + VMD + AWSL')
 
     # Data
-    parser.add_argument('--root_path', type=str, default='./data/ETT/', help='root path of dataset')
-    parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='data file')
+    parser.add_argument('--root_path', type=str, default='./dataset/', help='root path of dataset')
+    parser.add_argument('--data_path', type=str, default='stock.csv', help='data file')
     parser.add_argument('--features', type=str, default='S', help='forecasting task, options:[M, S, MS]')
-    parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
+    parser.add_argument('--target', type=str, default='close', help='target feature in S or MS task')
     parser.add_argument('--freq', type=str, default='h', help='frequency for time features encoding')
     parser.add_argument('--checkpoints', type=str, default='./checkpoints/', help='location of model checkpoints')
 
     # Seq lengths
     parser.add_argument('--seq_len', type=int, default=96, help='input sequence length')
     parser.add_argument('--label_len', type=int, default=48, help='start token length')
-    parser.add_argument('--pred_len', type=int, default=24, help='prediction sequence length')
+    parser.add_argument('--pred_len', type=int, default=1, help='prediction sequence length')
 
     # Model
     parser.add_argument('--model', type=str, default='PatchTST', help='model name')

@@ -328,12 +328,12 @@ class Exp_Main(Exp_Basic):
             self.model.load_state_dict(torch.load(path, map_location=self.device))
 
         self.model.eval()
-
+        _, _, predict_loader = self._get_data(flag="test")
         preds_all = []
         trues_all = []
 
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(self.test_loader):
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(self.predict_loader):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)

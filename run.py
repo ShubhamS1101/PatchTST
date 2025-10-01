@@ -4,6 +4,7 @@ import torch
 
 from PatchTST.Exp.Exp_main import Exp_Main
 
+
 def main():
     parser = argparse.ArgumentParser(description='PatchTST + VMD + AWSL')
 
@@ -33,6 +34,12 @@ def main():
     parser.add_argument('--patch_len', type=int, default=16, help='patch length')
     parser.add_argument('--stride', type=int, default=8, help='stride between patches')
     parser.add_argument('--padding_patch', type=str, default='end', help='padding method')
+
+    # Extra (needed by Patch.py)
+    parser.add_argument('--individual', action='store_true', help='individual linear projection per channel')
+    parser.add_argument('--revin', action='store_true', help='use RevIN normalization')
+    parser.add_argument('--affine', action='store_true', help='use affine transform in RevIN')
+    parser.add_argument('--subtract_last', action='store_true', help='subtract last value in RevIN')
 
     # Options
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')

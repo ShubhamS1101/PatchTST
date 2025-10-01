@@ -12,6 +12,7 @@ from torch.optim import lr_scheduler
 import os
 import time
 import warnings
+import logging
 
 from PatchTST.model import Patch
 
@@ -30,15 +31,14 @@ class Exp_Main(Exp_Basic):
         return model
 
     def _get_data(self, flag):
-        """Return dataset and dataloader for train/val/test/pred"""
+        """Return dataset, dataloader, and scaler (scaler=None if not provided)."""
         result = data_provider(self.args, flag)
         if len(result) == 3:
             data_set, data_loader, scaler = result
         else:
             data_set, data_loader = result
-            scaler = None  # fallback if not returned
-        return data_set, data_loader
-
+            scaler = None
+        return data_set, data_loader, scaler
 
     def _select_optimizer(self):
         model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
@@ -51,53 +51,33 @@ class Exp_Main(Exp_Basic):
     def _align_outputs_and_targets(self, outputs, batch_y):
         """
         Align shapes between outputs and batch_y.
-
-        outputs: tensor [B, pred_len, C_out]
-        batch_y: tensor [B, pred_len, C_y] (or larger window - caller should slice)
-        Return: outputs_sliced, batch_y_sliced (both on same device)
         """
-        # ensure both are tensors
         if not torch.is_tensor(outputs):
             outputs = torch.tensor(outputs)
-
         if not torch.is_tensor(batch_y):
             batch_y = torch.tensor(batch_y)
 
-        # If outputs have a single channel, slice batch_y to single target channel
         if outputs.shape[-1] == 1:
-            # keep last channel if multivariate, else keep channel 0
             if batch_y.shape[-1] >= 1:
                 target = batch_y[..., -1:] if batch_y.shape[-1] > 1 else batch_y[..., :1]
             else:
                 target = batch_y
             return outputs, target.to(outputs.device)
 
-        # If outputs channels match batch_y channels, just return trimmed windows
         if outputs.shape[-1] == batch_y.shape[-1]:
             return outputs, batch_y.to(outputs.device)
 
-        # Otherwise we attempt to use features setting:
-        # If multivariate forecasting (MS), keep all channels, else pick last channel (assumed target)
         if getattr(self.args, "features", "S") == "MS":
-            # If batch_y has more channels than outputs, try to select the last outputs.shape[-1] channels
             if batch_y.shape[-1] >= outputs.shape[-1]:
                 target = batch_y[..., -outputs.shape[-1]:]
                 return outputs, target.to(outputs.device)
             else:
-                # fallback: expand batch_y by repeating last channel (not ideal, but prevents crash)
                 repeat_factor = outputs.shape[-1] // max(1, batch_y.shape[-1])
                 target = batch_y.repeat(1, 1, repeat_factor)[:, :, : outputs.shape[-1]]
                 return outputs, target.to(outputs.device)
         else:
-            # Single-series forecasting (S): pick the last channel of batch_y
             target = batch_y[..., -1:].to(outputs.device) if batch_y.shape[-1] >= 1 else batch_y.to(outputs.device)
-            # If outputs expect multiple channels (e.g., num_imfs), but ASWL not used,
-            # we leave outputs as-is and compare per-imf (some workflows expect this).
-            # But for loss calculation we need shapes equal. If outputs has >1 channel and target has 1,
-            # attempt to reduce outputs by taking the last channel or mean across channels.
             if outputs.shape[-1] > 1 and target.shape[-1] == 1:
-                # Prefer taking the weighted/mean collapse so that loss can be computed.
-                # Use mean across channels as fallback (if ASWL not present).
                 outputs_collapsed = outputs.mean(dim=-1, keepdim=True)
                 return outputs_collapsed, target
             return outputs, target
@@ -110,21 +90,16 @@ class Exp_Main(Exp_Basic):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
 
-                # forward
                 if getattr(self.args, "use_amp", False):
                     with torch.cuda.amp.autocast():
                         outputs = self.model(batch_x)
                 else:
                     outputs = self.model(batch_x)
 
-                # outputs & batch_y alignment
-                # keep only last pred_len timesteps for both
                 outputs = outputs[:, -self.args.pred_len:, :]
                 batch_y_window = batch_y[:, -self.args.pred_len:, :]
 
                 outputs_aligned, target_aligned = self._align_outputs_and_targets(outputs, batch_y_window)
-
-                # compute loss on CPU tensors or on device (criterion expects same device)
                 loss = criterion(outputs_aligned.to(self.device), target_aligned.to(self.device))
                 total_loss.append(loss.item())
 
@@ -133,16 +108,15 @@ class Exp_Main(Exp_Basic):
         return total_loss
 
     def train(self, setting):
-        train_data, train_loader = self._get_data(flag='train')
-        vali_data, vali_loader = self._get_data(flag='val')
-        test_data, test_loader = self._get_data(flag='test')
+        train_data, train_loader, _ = self._get_data(flag='train')
+        vali_data, vali_loader, _ = self._get_data(flag='val')
+        test_data, test_loader, _ = self._get_data(flag='test')
 
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
             os.makedirs(path)
 
         time_now = time.time()
-
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
@@ -153,7 +127,6 @@ class Exp_Main(Exp_Basic):
         if getattr(self.args, "use_amp", False):
             scaler = torch.cuda.amp.GradScaler()
 
-        # OneCycleLR is used when args.lradj == 'TST' in original code. Keep behavior.
         scheduler = lr_scheduler.OneCycleLR(
             optimizer=model_optim,
             steps_per_epoch=max(1, train_steps),
@@ -165,9 +138,9 @@ class Exp_Main(Exp_Basic):
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
-
             self.model.train()
             epoch_time = time.time()
+
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
                 iter_count += 1
                 model_optim.zero_grad()
@@ -175,7 +148,6 @@ class Exp_Main(Exp_Basic):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
 
-                # forward
                 if scaler is not None:
                     with torch.cuda.amp.autocast():
                         outputs = self.model(batch_x)
@@ -192,7 +164,6 @@ class Exp_Main(Exp_Basic):
 
                 train_loss.append(loss.item())
 
-                # logging / ETA
                 if (i + 1) % 100 == 0:
                     print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
                     speed = (time.time() - time_now) / (iter_count if iter_count > 0 else 1)
@@ -201,7 +172,6 @@ class Exp_Main(Exp_Basic):
                     iter_count = 0
                     time_now = time.time()
 
-                # backward
                 if scaler is not None:
                     scaler.scale(loss).backward()
                     scaler.step(model_optim)
@@ -210,13 +180,10 @@ class Exp_Main(Exp_Basic):
                     loss.backward()
                     model_optim.step()
 
-                # lr scheduling
                 if getattr(self.args, "lradj", "TST") == 'TST':
-                    # original repo used a custom adjust_learning_rate + scheduler.step
                     adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
                     scheduler.step()
 
-            # epoch end
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss_avg = np.average(train_loss) if len(train_loss) > 0 else 0.0
             vali_loss = self.vali(vali_data, vali_loader, criterion)
@@ -229,13 +196,11 @@ class Exp_Main(Exp_Basic):
                 print("Early stopping")
                 break
 
-            # alternate lr adjust (if not using TST)
             if getattr(self.args, "lradj", "TST") != 'TST':
                 adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args)
             else:
                 print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
 
-        # load best checkpoint (EarlyStopping wrote it to path)
         best_model_path = os.path.join(path, 'checkpoint.pth')
         if os.path.exists(best_model_path):
             self.model.load_state_dict(torch.load(best_model_path))
@@ -245,7 +210,7 @@ class Exp_Main(Exp_Basic):
         return self.model
 
     def test(self, setting, test=0):
-        test_data, test_loader = self._get_data(flag='test')
+        test_data, test_loader, _ = self._get_data(flag='test')
 
         if test:
             print('loading model')
@@ -273,38 +238,26 @@ class Exp_Main(Exp_Basic):
                 outputs_np = outputs_aligned.detach().cpu().numpy()
                 batch_y_np = target_aligned.detach().cpu().numpy()
 
-                pred = outputs_np
-                true = batch_y_np
-
-                preds.append(pred)
-                trues.append(true)
+                preds.append(outputs_np)
+                trues.append(batch_y_np)
                 inputx.append(batch_x.detach().cpu().numpy())
 
                 if i % 20 == 0:
-                    input_ = batch_x.detach().cpu().numpy()
-                    # guard shapes when visualizing
                     try:
-                        gt = np.concatenate((input_[0, :, -1], true[0, :, -1]), axis=0)
-                        pd = np.concatenate((input_[0, :, -1], pred[0, :, -1]), axis=0)
+                        gt = np.concatenate((inputx[-1][0, :, -1], batch_y_np[0, :, -1]), axis=0)
+                        pd = np.concatenate((inputx[-1][0, :, -1], outputs_np[0, :, -1]), axis=0)
                         visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
                     except Exception:
-                        # skip visualization on mismatch
                         pass
 
         if getattr(self.args, "test_flop", False):
             test_params_flop((batch_x.shape[1], batch_x.shape[2]))
             exit()
 
-        preds = np.array(preds)
-        trues = np.array(trues)
-        inputx = np.array(inputx)
+        preds = np.array(preds).reshape(-1, preds[0].shape[-2], preds[0].shape[-1])
+        trues = np.array(trues).reshape(-1, trues[0].shape[-2], trues[0].shape[-1])
+        inputx = np.array(inputx).reshape(-1, inputx[0].shape[-2], inputx[0].shape[-1])
 
-        # reshape to [N, pred_len, C]
-        preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
-        trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])
-        inputx = inputx.reshape(-1, inputx.shape[-2], inputx.shape[-1])
-
-        # result save
         folder_path = './results/' + setting + '/'
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
@@ -320,17 +273,21 @@ class Exp_Main(Exp_Basic):
         return
 
     def predict(self, setting, load=True):
+        import numpy as np
+
         pred_folder = os.path.join('./results', setting, 'pred/')
         os.makedirs(pred_folder, exist_ok=True)
 
         if load:
             path = os.path.join(self.args.checkpoints, setting, 'checkpoint.pth')
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Checkpoint not found: {path}")
             self.model.load_state_dict(torch.load(path, map_location=self.device))
 
         self.model.eval()
-        _, predict_loader = self._get_data(flag="test")
-        preds_all = []
-        trues_all = []
+        _, predict_loader, _ = self._get_data(flag="test")
+
+        preds_all, trues_all = [], []
 
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(predict_loader):
@@ -339,48 +296,38 @@ class Exp_Main(Exp_Basic):
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
 
-                outputs = self.model(batch_x, batch_x_mark, batch_y, batch_y_mark)
-            # outputs: [B, pred_len, num_imfs] (scaled IMF predictions)
+                outputs = self.model(batch_x, batch_x_mark)
 
-            # -------- INVERSE TRANSFORM --------
                 if self.args.use_vmd:
                     preds_imfs = []
                     for imf_idx in range(outputs.shape[-1]):
                         pred_imf = outputs[..., imf_idx].detach().cpu().numpy()
                         pred_imf = self.scalers[imf_idx].inverse_transform(
                             pred_imf.reshape(-1, 1)
-                        ).reshape(pred_imf.shape)  # back to rupees
+                        ).reshape(pred_imf.shape)
                         preds_imfs.append(pred_imf)
 
-                    preds_denorm = np.stack(preds_imfs, axis=-1)  # [B, pred_len, num_imfs]
-
+                    preds_denorm = np.stack(preds_imfs, axis=-1)
                     if self.args.use_aswl:
-                    # get learned weights
                         w = torch.softmax(self.model.aswl.weights, dim=0).detach().cpu().numpy()
                         preds_final = np.tensordot(preds_denorm, w, axes=([-1], [0]))
-                        preds_final = preds_final[..., None]  # [B, pred_len, 1]
+                        preds_final = preds_final[..., None]
                     else:
                         preds_final = np.sum(preds_denorm, axis=-1, keepdims=True)
-
                 else:
-                # if not VMD, just inverse-transform whole series
                     preds_final = self.scaler.inverse_transform(
                         outputs.detach().cpu().numpy().reshape(-1, outputs.shape[-1])
                     ).reshape(outputs.shape)
 
                 preds_all.append(preds_final)
-
-            # ground truth in rupees
                 true_y = batch_y[:, -self.args.pred_len:, -1].detach().cpu().numpy()
                 trues_all.append(true_y[..., None])
-  
+
         preds_all = np.concatenate(preds_all, axis=0)
         trues_all = np.concatenate(trues_all, axis=0)
 
-    # -------- SAVE --------
         np.save(os.path.join(pred_folder, 'real_prediction.npy'), preds_all)
         np.save(os.path.join(pred_folder, 'real_truth.npy'), trues_all)
 
-        logging.info(f"Saved predictions to {pred_folder}")
+        logging.info(f"✅ Saved predictions to {pred_folder}")
         return preds_all, trues_all
-

@@ -232,6 +232,9 @@ class Exp_Main(Exp_Basic):
                 # assume self.scalers is a dict or list-like of fitted scaler objects
                 for i, sc in enumerate(self.scalers):
                     joblib.dump(sc, os.path.join(save_dir, f"scaler_imf{i}.pkl"))
+                for i in range(len(self.scalers)):
+                    joblib.dump(self.scalers[i], os.path.join(save_dir, f"hello{i}.pkl"))
+                    print(type(self.scalers[i]))
                 print(f"✅ Saved {len(self.scalers)} IMF scalers to {save_dir}")
             elif self.scaler is not None:
                 joblib.dump(self.scaler, os.path.join(save_dir, "scaler.pkl"))
@@ -327,7 +330,7 @@ class Exp_Main(Exp_Basic):
                 # load per-imf scalers
                 loaded = []
                 for i in range(int(self.args.num_imfs)):
-                    p = os.path.join(scalers_folder, f"scaler_imf{i}.pkl")
+                    p = os.path.join(scalers_folder, f"hello{i}.pkl")
                     if os.path.exists(p):
                         loaded.append(joblib.load(p))
                     else:

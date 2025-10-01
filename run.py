@@ -93,40 +93,50 @@ def parse_args():
 
 
 def validate_args(args):
+    # Ensure device_ids is always a string first
+    if isinstance(args.device_ids, list):
+        device_ids_str = ','.join([str(x) for x in args.device_ids])
+    else:
+        device_ids_str = args.device_ids
+
     # GPU availability
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
-    if args.use_gpu and args.use_multi_gpu:
-        devices = args.device_ids.replace(' ', '')
-        ids = [int(x) for x in devices.split(',') if x != '']
-        if len(ids) == 0:
-            logging.warning("No device ids parsed from --device_ids; falling back to [0].")
-            ids = [0]
-        args.device_ids = ids
-        args.gpu = args.device_ids[0]
-    else:
-        # single GPU or CPU
-        try:
-            args.gpu = int(args.device_ids.split(',')[0].strip())
-            args.device_ids = [args.gpu]
-        except Exception:
-            args.device_ids = [0]
-            args.gpu = 0
 
-    # VMD dependency check
     if args.use_gpu and args.use_multi_gpu:
-        devices = args.device_ids.replace(' ', '')
+        devices = device_ids_str.replace(' ', '')
         ids = [int(x) for x in devices.split(',') if x != '']
         if len(ids) == 0:
             logging.warning("No device ids parsed from --device_ids; falling back to 0.")
             ids = [0]
-        args.device_ids_list = ids  # keep as list for internal use
-        args.device_ids = devices   # keep original string for Exp_Main/Exp_basic
+        args.device_ids_list = ids    # list for internal use
+        args.device_ids = devices     # string for compatibility
         args.gpu = ids[0]
     else:
-    # single GPU or CPU
-        args.device_ids_list = [int(args.device_ids.split(',')[0].strip())]
-        args.gpu = args.device_ids_list[0]
+        # single GPU or CPU
+        try:
+            args.gpu = int(device_ids_str.split(',')[0].strip())
+            args.device_ids = device_ids_str  # keep string
+            args.device_ids_list = [args.gpu] # list for internal use
+        except Exception:
+            args.device_ids = '0'
+            args.device_ids_list = [0]
+            args.gpu = 0
 
+    # VMD dependency check
+    if args.use_vmd:
+        try:
+            import vmdpy  # noqa: F401
+        except Exception as e:
+            raise RuntimeError("vmdpy is required for --use_vmd. Install with `pip install vmdpy`") from e
+
+        if args.num_imfs <= 0:
+            logging.warning("--num_imfs <= 0; setting num_imfs=1")
+            args.num_imfs = 1
+
+    if args.use_aswl and args.num_imfs <= 1:
+        logging.warning("ASWL requested but num_imfs <= 1; ASWL will have trivial effect.")
+
+    return args
 
 
 def build_setting_string(args, iteration=0):

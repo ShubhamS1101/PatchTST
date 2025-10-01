@@ -30,9 +30,15 @@ class Exp_Main(Exp_Basic):
         return model
 
     def _get_data(self, flag):
-        """Return dataset and dataloader for train/val/test/pred"""
-        data_set, data_loader, scaler = data_provider(self.args, flag)
+    """Return dataset and dataloader for train/val/test/pred"""
+        result = data_provider(self.args, flag)
+        if len(result) == 3:
+            data_set, data_loader, scaler = result
+        else:
+            data_set, data_loader = result
+            scaler = None  # fallback if not returned
         return data_set, data_loader
+
 
     def _select_optimizer(self):
         model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)

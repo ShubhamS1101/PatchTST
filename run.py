@@ -113,20 +113,20 @@ def validate_args(args):
             args.gpu = 0
 
     # VMD dependency check
-    if args.use_vmd:
-        try:
-            import vmdpy  # noqa: F401
-        except Exception as e:
-            raise RuntimeError("vmdpy is required for --use_vmd. Install with `pip install vmdpy`") from e
+    if args.use_gpu and args.use_multi_gpu:
+        devices = args.device_ids.replace(' ', '')
+        ids = [int(x) for x in devices.split(',') if x != '']
+        if len(ids) == 0:
+            logging.warning("No device ids parsed from --device_ids; falling back to 0.")
+            ids = [0]
+        args.device_ids_list = ids  # keep as list for internal use
+        args.device_ids = devices   # keep original string for Exp_Main/Exp_basic
+        args.gpu = ids[0]
+    else:
+    # single GPU or CPU
+        args.device_ids_list = [int(args.device_ids.split(',')[0].strip())]
+        args.gpu = args.device_ids_list[0]
 
-        if args.num_imfs <= 0:
-            logging.warning("--num_imfs <= 0; setting num_imfs=1")
-            args.num_imfs = 1
-
-    if args.use_aswl and args.num_imfs <= 1:
-        logging.warning("ASWL requested but num_imfs <= 1; ASWL will have trivial effect.")
-
-    return args
 
 
 def build_setting_string(args, iteration=0):

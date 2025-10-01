@@ -49,7 +49,7 @@ def data_provider(args, flag):
     # Return scalers only during training
     if flag == 'train' and hasattr(data_set, "scalers"):
         print("Teri maa ki chut")
-        print(type(data_set.scalers))
+        print(type(data_set.scalers[0]))
         return data_set, data_loader, data_set.scalers
     else:
         return data_set, data_loader

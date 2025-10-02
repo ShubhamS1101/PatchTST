@@ -442,7 +442,7 @@ class Dataset_Pred(Dataset):
         if s_end < len(self.data_x):
             seq_y_raw = self.data_raw[s_end]  # next point
         else:
-            seq_y_raw = None
+            seq_y_raw = np.nan
     
         return seq_x, seq_x_mark, seq_y_raw
 

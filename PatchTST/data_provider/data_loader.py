@@ -309,31 +309,32 @@ class Dataset_Custom(Dataset):
                 raise RuntimeError("No scaler available for inverse transform")
             return self.scaler.inverse_transform(data)
 
+import os
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 class Dataset_Pred(Dataset):
     def __init__(self, root_path, flag='pred', size=None,
                  features='S', data_path='ETTh1.csv',
-                 target='OT', scale=True, inverse=False, timeenc=0, freq='15min', cols=None,
-                 use_vmd=False, num_imfs=5, scaler_type='minmax', vmd_alpha=2000, vmd_tau=0., vmd_DC=0, vmd_init=1, vmd_tol=1e-7,
+                 target='OT', scale=True, timeenc=0, freq='15min', cols=None,
+                 use_vmd=False, num_imfs=5, scaler_type='minmax',
+                 vmd_alpha=2000, vmd_tau=0., vmd_DC=0, vmd_init=1, vmd_tol=1e-7,
                  scalers=None):
         """
-        Prediction dataset. Accepts same vmd/scaler params and optionally 'scalers' dict from training.
-        If scalers provided and use_vmd True, those per-imf scalers will be used to scale the imf columns.
+        Prediction dataset with sliding windows.
+        Produces all windows of length seq_len for inference.
         """
         if size is None:
-            self.seq_len = 24 * 4 * 4
-            self.label_len = 24 * 4
-            self.pred_len = 24 * 4
+            self.seq_len = 96   # default sequence length
         else:
             self.seq_len = size[0]
-            self.label_len = size[1]
-            self.pred_len = size[2]
 
         assert flag in ['pred']
         self.features = features
         self.target = target
         self.scale = scale
-        self.inverse = inverse
         self.timeenc = timeenc
         self.freq = freq
         self.cols = cols
@@ -364,12 +365,13 @@ class Dataset_Pred(Dataset):
             cols.remove(self.target)
             cols.remove('date')
         df_raw = df_raw[['date'] + cols + [self.target]]
-
-        border1 = len(df_raw) - self.seq_len
+        # store raw ground truth
+        self.data_raw = df_raw[[self.target]].values
+        border1 = 0
         border2 = len(df_raw)
 
         if self.use_vmd:
-            # Decompose the target over the full available range
+            # You must define _run_vmd() somewhere
             full_signal = df_raw[self.target].values.astype(float)
             u = _run_vmd(full_signal,
                          alpha=self.vmd_alpha, tau=self.vmd_tau,
@@ -385,16 +387,15 @@ class Dataset_Pred(Dataset):
             elif self.features == 'S':
                 df_data = df_raw[[self.target]]
 
-        # scaling: reuse external scalers if provided
+        # scaling
         if self.scale:
             if self.use_vmd:
                 imf_cols = df_data.columns.tolist()
                 if self.external_scalers is None:
-                    # As a fallback, fit scalers on entirety of df_data (less ideal)
                     self.scalers = {}
                     for i, col in enumerate(imf_cols):
                         sc = MinMaxScaler(feature_range=(0, 1)) if self.scaler_type == 'minmax' else StandardScaler()
-                        sc.fit(df_data[[col]].values)  # fit on whole series (fallback)
+                        sc.fit(df_data[[col]].values)
                         self.scalers[i] = sc
                 else:
                     self.scalers = self.external_scalers
@@ -404,108 +405,83 @@ class Dataset_Pred(Dataset):
                     data_scaled[:, i] = self.scalers[i].transform(df_data[[col]].values).reshape(-1)
                 data = data_scaled
             else:
-                # non-vmd: use provided scaler object if present
                 if self.external_scalers is not None and isinstance(self.external_scalers, (StandardScaler, MinMaxScaler)):
                     self.scaler = self.external_scalers
                 else:
-                    # fallback: fit scaler on full df (less ideal)
                     self.scaler = MinMaxScaler(feature_range=(0, 1)) if self.scaler_type == 'minmax' else StandardScaler()
                     self.scaler.fit(df_data.values)
                 data = self.scaler.transform(df_data.values)
         else:
             data = df_data.values
 
-        tmp_stamp = df_raw[['date']][border1:border2]
-        tmp_stamp['date'] = pd.to_datetime(tmp_stamp.date)
-        pred_dates = pd.date_range(tmp_stamp.date.values[-1], periods=self.pred_len + 1, freq=self.freq)
-
-        df_stamp = pd.DataFrame(columns=['date'])
-        df_stamp.date = list(tmp_stamp.date.values) + list(pred_dates[1:])
+        # time features
+        df_stamp = pd.DataFrame()
+        df_stamp['date'] = pd.to_datetime(df_raw['date'])
         if self.timeenc == 0:
-            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
-            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
-            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
-            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
-            df_stamp['minute'] = df_stamp.date.apply(lambda row: row.minute, 1)
+            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month)
+            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day)
+            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday())
+            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour)
+            df_stamp['minute'] = df_stamp.date.apply(lambda row: row.minute)
             df_stamp['minute'] = df_stamp.minute.map(lambda x: x // 15)
-            data_stamp = df_stamp.drop(['date'], 1).values
+            data_stamp = df_stamp.drop(['date'], axis=1).values
         elif self.timeenc == 1:
             data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
             data_stamp = data_stamp.transpose(1, 0)
 
-        self.data_x = data[border1:border2]
-        if self.inverse:
-            self.data_y = df_data.values[border1:border2]
-        else:
-            self.data_y = data[border1:border2]
+        self.data_x = data
         self.data_stamp = data_stamp
-
     def __getitem__(self, index):
         s_begin = index
-        s_end = s_begin + self.seq_len
-        r_begin = s_end - self.label_len
-        r_end = r_begin + self.label_len + self.pred_len
+        s_end = index + self.seq_len
 
         seq_x = self.data_x[s_begin:s_end]
-        if self.inverse:
-            seq_y = self.data_x[r_begin:r_begin + self.label_len]
-        else:
-            seq_y = self.data_y[r_begin:r_begin + self.label_len]
         seq_x_mark = self.data_stamp[s_begin:s_end]
-        seq_y_mark = self.data_stamp[r_begin:r_end]
 
-        return seq_x, seq_y, seq_x_mark, seq_y_mark
+        # raw ground truth (unscaled)
+        seq_y_raw = self.data_raw[s_begin:s_end]
+
+        return seq_x, seq_x_mark, seq_y_raw 
+
 
     def __len__(self):
         return len(self.data_x) - self.seq_len + 1
 
-    def inverse_transform_imfs(self, imf_preds):
-        # same implementation as Dataset_Custom (you could factor this out)
-        if not self.use_vmd:
-            if self.scaler is None:
-                raise RuntimeError("No scaler available")
-            arr = np.asarray(imf_preds)
-            shape = arr.shape
-            flat = arr.reshape(-1, shape[-1]) if arr.ndim >= 2 else arr.reshape(-1, 1)
-            inv = self.scaler.inverse_transform(flat)
-            return inv.reshape(shape)
-        K = self.num_imfs
-        arr = np.asarray(imf_preds)
-        if arr.ndim == 2 and arr.shape[0] == K:
-            k_t = arr
-            inv_imfs = []
-            for i in range(K):
-                sc = self.scalers[i]
-                col = k_t[i].reshape(-1, 1)
-                inv_col = sc.inverse_transform(col).reshape(-1)
-                inv_imfs.append(inv_col)
-            inv_imfs = np.vstack(inv_imfs)
-            return inv_imfs.sum(axis=0)
-        elif arr.ndim == 3:
-            if arr.shape[1] == K:
-                B, K_, T = arr.shape
-                out = np.zeros((B, T))
-                for b in range(B):
-                    inv_imfs = []
-                    for i in range(K):
-                        sc = self.scalers[i]
-                        col = arr[b, i, :].reshape(-1, 1)
-                        inv_col = sc.inverse_transform(col).reshape(-1)
-                        inv_imfs.append(inv_col)
-                    out[b] = np.vstack(inv_imfs).sum(axis=0)
-                return out
-            elif arr.shape[2] == K:
-                arr2 = arr.transpose(0, 2, 1)
-                return self.inverse_transform_imfs(arr2)
-            else:
-                raise ValueError("Cannot interpret shape for inverse_transform_imfs")
-        else:
-            raise ValueError("Unsupported array shape for inverse_transform_imfs")
-
+    # ==== Transform helpers ====
     def inverse_transform(self, data):
         if self.use_vmd:
             return self.inverse_transform_imfs(data)
         else:
-            if self.scaler is None:
+            if not hasattr(self, "scaler"):
                 raise RuntimeError("No scaler available for inverse")
             return self.scaler.inverse_transform(data)
+
+    def inverse_transform_imfs(self, imf_preds):
+        """
+        Inverse scaling and recombine IMFs to reconstruct original signal.
+        """
+        if not self.use_vmd:
+            return self.inverse_transform(imf_preds)
+
+        K = self.num_imfs
+        arr = np.asarray(imf_preds)
+
+        if arr.ndim == 2 and arr.shape[1] == K:  # (T, K)
+            out = np.zeros(arr.shape[0])
+            for i in range(K):
+                sc = self.scalers[i]
+                inv_col = sc.inverse_transform(arr[:, i].reshape(-1, 1)).reshape(-1)
+                out += inv_col
+            return out
+
+        elif arr.ndim == 3:  # (B, T, K)
+            B, T, K_ = arr.shape
+            out = np.zeros((B, T))
+            for b in range(B):
+                for i in range(K):
+                    sc = self.scalers[i]
+                    inv_col = sc.inverse_transform(arr[b, :, i].reshape(-1, 1)).reshape(-1)
+                    out[b] += inv_col
+            return out
+        else:
+            raise ValueError(f"Unsupported shape for inverse_transform_imfs: {arr.shape}")

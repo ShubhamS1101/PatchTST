@@ -323,125 +323,74 @@ class Exp_Main(Exp_Basic):
                 raise FileNotFoundError(f"Checkpoint not found: {path}")
             self.model.load_state_dict(torch.load(path, map_location=self.device))
 
-        # ---- Ensure scalers are available: try to load from saved results folder
-        scalers_folder = os.path.join('./results', setting)
-        try:
-            if getattr(self.args, "use_vmd", False):
-                # load per-imf scalers
-                loaded = []
-                for i in range(int(self.args.num_imfs)):
-                    p = os.path.join(scalers_folder, f"hello{i}.pkl")
-                    if os.path.exists(p):
-                        loaded.append(joblib.load(p))
-                    else:
-                        loaded.append(None)
-                self.scalers = loaded
-                if any(s is None for s in loaded):
-                    logging.warning("Some IMF scaler files missing; inverse transform may be inaccurate.")
-            else:
-                p = os.path.join(scalers_folder, "scaler.pkl")
-                if os.path.exists(p):
-                    self.scaler = joblib.load(p)
-                else:
-                    logging.warning("No single scaler.pkl found for this setting.")
-        except Exception as e:
-            logging.warning(f"Failed to load scalers: {e}")
+        # ---- Prediction data loader ----
+        predict_data, predict_loader, _ = self._get_data(flag="pred")
+
+        # ---- Use scalers from the dataset ----
+        if hasattr(predict_data, "scalers"):
+            self.scalers = predict_data.scalers
+        if hasattr(predict_data, "scaler"):
+            self.scaler = predict_data.scaler
+
+        preds_all = []
+        trues_all = []
 
         self.model.eval()
-        _, predict_loader, _ = self._get_data(flag="test")
-
-        preds_all, trues_all = [], []
-
         with torch.no_grad():
-            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(predict_loader):
+            for i, (batch_x, batch_x_mark, batch_y_raw) in enumerate(predict_loader):
+
                 batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                print(f"[DEBUG] Batch {i}: batch_x shape = {batch_x.shape}, batch_x_mark shape = {batch_x_mark.shape}")
 
-                # ---- Forward pass (use same call as training) ----
-                outputs = self.model(batch_x)
-                outputs = outputs[:, -self.args.pred_len:, :]
-
-                # ---- Inverse transform / reconstruct into original units (rupees) ----
+                # ---- Forward pass ----
+                outputs = self.model(batch_x, batch_x_mark)   # [B, pred_len, C]
+                outputs = outputs[:, -self.args.pred_len:, :] # keep last pred_len
+                print(f"[DEBUG] Batch {i}: outputs shape = {outputs.shape}")  
+                trues_all.append(batch_y_raw.numpy())
+                # ---- Inverse transform using dataset scalers ----
                 if getattr(self.args, "use_vmd", False):
-                    # outputs shape: [B, pred_len, num_imfs] (or if ASWL=True maybe [B, pred_len,1])
                     if outputs.shape[-1] == 1 and getattr(self.args, "use_aswl", False):
-                        # already weighted sum (scaled). We expect a single-channel scaled prediction.
-                        # If single-channel, but scalers are IMF-wise, we cannot inverse per-imf — assume saved final scaled->raw mapping unavailable.
-                        # Best-effort: if train saved a single scaler (rare), use it; otherwise proceed without inverse.
-                        if self.scaler is not None:
-                            preds_final = self.scaler.inverse_transform(outputs.detach().cpu().numpy().reshape(-1, 1)).reshape(outputs.shape)
+                        if hasattr(self, "scaler") and self.scaler is not None:
+                            preds_final = self.scaler.inverse_transform(
+                                outputs.detach().cpu().numpy().reshape(-1, 1)
+                            ).reshape(outputs.shape)
                         else:
-                            # Try to reconstruct by inverse-transforming IMFs predicted earlier — but we don't have them if ASWL returned single channel.
-                            logging.warning("ASWL produced single-channel scaled output and no single scaler found; saving scaled outputs.")
                             preds_final = outputs.detach().cpu().numpy()
                     else:
-                        # per-IMF outputs available: inverse each IMFs then sum or weight
                         preds_imfs = []
                         for imf_idx in range(outputs.shape[-1]):
                             pred_imf = outputs[..., imf_idx].detach().cpu().numpy()
                             sc = None
-                            if self.scalers is not None and imf_idx < len(self.scalers):
+                            if hasattr(self, "scalers") and self.scalers is not None and imf_idx < len(self.scalers):
                                 sc = self.scalers[imf_idx]
                             if sc is not None:
                                 pred_imf = sc.inverse_transform(pred_imf.reshape(-1, 1)).reshape(pred_imf.shape)
-                            else:
-                                logging.warning(f"No scaler for IMF {imf_idx}; keeping scaled values for that IMF.")
                             preds_imfs.append(pred_imf)
-                        preds_denorm = np.stack(preds_imfs, axis=-1)  # [B, pred_len, num_imfs]
+                        preds_denorm = np.stack(preds_imfs, axis=-1)
                         if getattr(self.args, "use_aswl", False) and hasattr(self.model, "aswl"):
                             w = torch.softmax(self.model.aswl.weights, dim=0).detach().cpu().numpy()
-                            preds_final = np.tensordot(preds_denorm, w, axes=([-1], [0]))  # [B, pred_len]
+                            preds_final = np.tensordot(preds_denorm, w, axes=([-1], [0]))
                             preds_final = preds_final[..., None]
                         else:
                             preds_final = np.sum(preds_denorm, axis=-1, keepdims=True)
                 else:
-                    # non-VMD case: use single scaler if available
                     out_np = outputs.detach().cpu().numpy().reshape(-1, outputs.shape[-1])
-                    if self.scaler is not None:
+                    if hasattr(self, "scaler") and self.scaler is not None:
                         inv = self.scaler.inverse_transform(out_np)
                         preds_final = inv.reshape(outputs.shape)
                     else:
-                        logging.warning("No scaler found for non-VMD case; saving scaled outputs.")
                         preds_final = outputs.detach().cpu().numpy()
 
                 preds_all.append(preds_final)
 
-                # ---- Ground truth in original units where possible ----
-                # batch_y may be scaled; if we have scalers we can inverse-transform target similarly.
-                true_segment = batch_y[:, -self.args.pred_len:, :].detach().cpu().numpy()
-                # If VMD, true_segment are IMFs (scaled) -> inverse per-imf and sum.
-                if getattr(self.args, "use_vmd", False):
-                    try:
-                        trues_imfs = []
-                        for imf_idx in range(true_segment.shape[-1]):
-                            sc = None
-                            if self.scalers is not None and imf_idx < len(self.scalers):
-                                sc = self.scalers[imf_idx]
-                            col = true_segment[..., imf_idx]
-                            if sc is not None:
-                                inv_col = sc.inverse_transform(col.reshape(-1, 1)).reshape(col.shape)
-                            else:
-                                inv_col = col
-                            trues_imfs.append(inv_col)
-                        trues_denorm = np.stack(trues_imfs, axis=-1)
-                        trues_final = np.sum(trues_denorm, axis=-1, keepdims=True)
-                    except Exception:
-                        trues_final = true_segment[..., :1]  # fallback
-                else:
-                    if self.scaler is not None:
-                        flat = true_segment.reshape(-1, true_segment.shape[-1])
-                        trues_final = self.scaler.inverse_transform(flat).reshape(true_segment.shape)
-                    else:
-                        trues_final = true_segment
-
-                trues_all.append(trues_final)
-
         preds_all = np.concatenate(preds_all, axis=0)
+        print(f"[DEBUG] All predictions shape: {preds_all.shape}")
         trues_all = np.concatenate(trues_all, axis=0)
-
         # ---- Save outputs ----
         np.save(os.path.join(pred_folder, 'real_prediction.npy'), preds_all)
         np.save(os.path.join(pred_folder, 'real_truth.npy'), trues_all)
 
         logging.info(f"✅ Saved predictions to {pred_folder}")
-        return preds_all, trues_all
+
+        return preds_all

@@ -434,14 +434,18 @@ class Dataset_Pred(Dataset):
     def __getitem__(self, index):
         s_begin = index
         s_end = index + self.seq_len
-
+    
         seq_x = self.data_x[s_begin:s_end]
         seq_x_mark = self.data_stamp[s_begin:s_end]
+    
+        # single ground truth value (next point)
+        if s_end < len(self.data_x):
+            seq_y_raw = self.data_raw[s_end]  # next point
+        else:
+            seq_y_raw = None
+    
+        return seq_x, seq_x_mark, seq_y_raw
 
-        # raw ground truth (unscaled)
-        seq_y_raw = self.data_raw[s_begin:s_end]
-
-        return seq_x, seq_x_mark, seq_y_raw 
 
 
     def __len__(self):

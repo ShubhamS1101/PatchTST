@@ -29,8 +29,8 @@ def _run_vmd(signal,
 
 class Dataset_Custom(Dataset):
     def __init__(self, root_path, flag='train', size=None,
-                 features='S', data_path='ETTh1.csv',
-                 target='OT', scale=True, timeenc=0, freq='h',
+                 features='S', data_path='stock.csv',
+                 target='close', scale=True, timeenc=0, freq='h',
                  use_vmd=False, num_imfs=5, scaler_type='minmax',
                  vmd_alpha=2000, vmd_tau=0., vmd_DC=0, vmd_init=1, vmd_tol=1e-7,
                  scalers=None):

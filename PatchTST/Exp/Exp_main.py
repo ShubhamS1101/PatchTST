@@ -361,9 +361,19 @@ class Exp_Main(Exp_Basic):
                         outputs = inv.reshape(outputs.shape)
                     else:
                         outputs = outputs.detach().cpu().numpy()
-    
+                if outputs.ndim == 3:
+
                 # ---- Collapse predictions to a single number per sample ----
-                preds_single = outputs[:, -1, :].sum(axis=-1)  # sum across features/IMFs, shape (B,)
+                      preds_single = outputs[:, -1, :].sum(axis=-1)  # sum across features/IMFs, shape (B,)
+
+                elif outputs.ndim == 2:
+    # (B, C)
+                      preds_single = outputs.sum(axis=-1)
+
+                else:
+                  raise ValueError(f"Unexpected output shape: {outputs.shape}")
+
+                  
                 preds_all.append(preds_single)
     
                 # ---- Collect ground truth ----

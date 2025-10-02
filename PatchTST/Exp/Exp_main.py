@@ -312,85 +312,78 @@ class Exp_Main(Exp_Basic):
 
     def predict(self, setting, load=True):
         import numpy as np
-
+        import os
+        import logging
+        import torch
+    
         pred_folder = os.path.join('./results', setting, 'pred/')
         os.makedirs(pred_folder, exist_ok=True)
-
+    
         # ---- Load trained model ----
         if load:
             path = os.path.join(self.args.checkpoints, setting, 'checkpoint.pth')
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Checkpoint not found: {path}")
             self.model.load_state_dict(torch.load(path, map_location=self.device))
-
+    
         # ---- Prediction data loader ----
         predict_data, predict_loader, _ = self._get_data(flag="pred")
-
+    
         # ---- Use scalers from the dataset ----
         if hasattr(predict_data, "scalers"):
             self.scalers = predict_data.scalers
         if hasattr(predict_data, "scaler"):
             self.scaler = predict_data.scaler
-
+    
         preds_all = []
         trues_all = []
-
+    
         self.model.eval()
         with torch.no_grad():
             for i, (batch_x, batch_x_mark, batch_y_raw) in enumerate(predict_loader):
-
+    
                 batch_x = batch_x.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 print(f"[DEBUG] Batch {i}: batch_x shape = {batch_x.shape}, batch_x_mark shape = {batch_x_mark.shape}")
-
+    
                 # ---- Forward pass ----
                 outputs = self.model(batch_x, batch_x_mark)   # [B, pred_len, C]
                 outputs = outputs[:, -self.args.pred_len:, :] # keep last pred_len
                 print(f"[DEBUG] Batch {i}: outputs shape = {outputs.shape}")  
-                trues_all.append(batch_y_raw.numpy())
-                # ---- Inverse transform using dataset scalers ----
+    
+                # ---- Inverse transform ----
                 if getattr(self.args, "use_vmd", False):
-                    if outputs.shape[-1] == 1 and getattr(self.args, "use_aswl", False):
-                        if hasattr(self, "scaler") and self.scaler is not None:
-                            preds_final = self.scaler.inverse_transform(
-                                outputs.detach().cpu().numpy().reshape(-1, 1)
-                            ).reshape(outputs.shape)
-                        else:
-                            preds_final = outputs.detach().cpu().numpy()
-                    else:
-                        preds_imfs = []
-                        for imf_idx in range(outputs.shape[-1]):
-                            pred_imf = outputs[..., imf_idx].detach().cpu().numpy()
-                            sc = None
-                            if hasattr(self, "scalers") and self.scalers is not None and imf_idx < len(self.scalers):
-                                sc = self.scalers[imf_idx]
-                            if sc is not None:
-                                pred_imf = sc.inverse_transform(pred_imf.reshape(-1, 1)).reshape(pred_imf.shape)
-                            preds_imfs.append(pred_imf)
-                        preds_denorm = np.stack(preds_imfs, axis=-1)
-                        if getattr(self.args, "use_aswl", False) and hasattr(self.model, "aswl"):
-                            w = torch.softmax(self.model.aswl.weights, dim=0).detach().cpu().numpy()
-                            preds_final = np.tensordot(preds_denorm, w, axes=([-1], [0]))
-                            preds_final = preds_final[..., None]
-                        else:
-                            preds_final = np.sum(preds_denorm, axis=-1, keepdims=True)
+                    outputs = predict_data.inverse_transform(outputs.detach().cpu().numpy())
                 else:
                     out_np = outputs.detach().cpu().numpy().reshape(-1, outputs.shape[-1])
                     if hasattr(self, "scaler") and self.scaler is not None:
                         inv = self.scaler.inverse_transform(out_np)
-                        preds_final = inv.reshape(outputs.shape)
+                        outputs = inv.reshape(outputs.shape)
                     else:
-                        preds_final = outputs.detach().cpu().numpy()
-
-                preds_all.append(preds_final)
-
-        preds_all = np.concatenate(preds_all, axis=0)
-        print(f"[DEBUG] All predictions shape: {preds_all.shape}")
-        trues_all = np.concatenate(trues_all, axis=0)
+                        outputs = outputs.detach().cpu().numpy()
+    
+                # ---- Collapse predictions to a single number per sample ----
+                preds_single = outputs[:, -1, :].sum(axis=-1)  # sum across features/IMFs, shape (B,)
+                preds_all.append(preds_single)
+    
+                # ---- Collect ground truth ----
+                batch_trues = []
+                for y_raw in batch_y_raw:
+                    if y_raw is not None:
+                        batch_trues.append(y_raw.reshape(-1).sum())  # single number
+                if batch_trues:
+                    trues_all.append(np.array(batch_trues))
+    
+        # ---- Concatenate predictions and ground truth ----
+        preds_all = np.concatenate(preds_all, axis=0)  # shape (num_samples,)
+        trues_all = np.concatenate(trues_all, axis=0) if trues_all else np.array([])
+    
+        print(f"[DEBUG] All predictions shape: {preds_all.shape}, All trues shape: {trues_all.shape}")
+    
         # ---- Save outputs ----
         np.save(os.path.join(pred_folder, 'real_prediction.npy'), preds_all)
         np.save(os.path.join(pred_folder, 'real_truth.npy'), trues_all)
-
+    
         logging.info(f"✅ Saved predictions to {pred_folder}")
-
-        return preds_all
+    
+        return preds_all, trues_all

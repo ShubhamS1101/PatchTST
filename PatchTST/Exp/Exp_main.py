@@ -315,85 +315,88 @@ class Exp_Main(Exp_Basic):
         import os
         import logging
         import torch
-    
+
         pred_folder = os.path.join('./results', setting, 'pred/')
         os.makedirs(pred_folder, exist_ok=True)
-    
+
         # ---- Load trained model ----
         if load:
             path = os.path.join(self.args.checkpoints, setting, 'checkpoint.pth')
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Checkpoint not found: {path}")
             self.model.load_state_dict(torch.load(path, map_location=self.device))
-    
+
         # ---- Prediction data loader ----
         predict_data, predict_loader, _ = self._get_data(flag="pred")
-    
+
         # ---- Use scalers from the dataset ----
         if hasattr(predict_data, "scalers"):
             self.scalers = predict_data.scalers
         if hasattr(predict_data, "scaler"):
             self.scaler = predict_data.scaler
-    
-        preds_all = []
-        trues_all = []
-    
+
+        preds_final_all = []   # denormalized + summed predictions
+        trues_final_all = []   # raw ground truth
+        preds_imfs_all = []    # normalized IMF predictions
+        trues_imfs_all = []    # normalized IMF ground truth
+
         self.model.eval()
         with torch.no_grad():
-            for i, (batch_x, batch_x_mark, batch_y_raw) in enumerate(predict_loader):
-    
+            for i, (batch_x, batch_x_mark, batch_y_raw, batch_y_imfs) in enumerate(predict_loader):
+
                 batch_x = batch_x.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
-                print(f"[DEBUG] Batch {i}: batch_x shape = {batch_x.shape}, batch_x_mark shape = {batch_x_mark.shape}")
-    
+
                 # ---- Forward pass ----
-                outputs = self.model(batch_x, batch_x_mark)   # [B, pred_len, C]
+                outputs = self.model(batch_x, batch_x_mark)   # [B, pred_len, K]
                 outputs = outputs[:, -self.args.pred_len:, :] # keep last pred_len
-                print(f"[DEBUG] Batch {i}: outputs shape = {outputs.shape}")  
-    
-                # ---- Inverse transform ----
+
+                # ---- Store normalized IMF predictions ----
+                preds_imfs_all.append(outputs[:, -1, :].detach().cpu().numpy())  # (B, K)
+
+                # ---- Inverse transform for reconstruction ----
                 if getattr(self.args, "use_vmd", False):
-                    outputs = predict_data.inverse_transform(outputs.detach().cpu().numpy())
+                    outputs_denorm = predict_data.inverse_transform(outputs.detach().cpu().numpy())
                 else:
                     out_np = outputs.detach().cpu().numpy().reshape(-1, outputs.shape[-1])
                     if hasattr(self, "scaler") and self.scaler is not None:
                         inv = self.scaler.inverse_transform(out_np)
-                        outputs = inv.reshape(outputs.shape)
+                        outputs_denorm = inv.reshape(outputs.shape)
                     else:
-                        outputs = outputs.detach().cpu().numpy()
-                if outputs.ndim == 3:
+                        outputs_denorm = outputs.detach().cpu().numpy()
 
-                # ---- Collapse predictions to a single number per sample ----
-                      preds_single = outputs[:, -1, :].sum(axis=-1)  # sum across features/IMFs, shape (B,)
-
-                elif outputs.ndim == 2:
-    # (B, C)
-                      preds_single = outputs.sum(axis=-1)
-
+                # ---- Collapse to final scalar prediction ----
+                if outputs_denorm.ndim == 3:   # (B, T, K)
+                    preds_single = outputs_denorm[:, -1, :].sum(axis=-1)  # (B,)
+                elif outputs_denorm.ndim == 2: # (B, K)
+                    preds_single = outputs_denorm.sum(axis=-1)            # (B,)
                 else:
-                  raise ValueError(f"Unexpected output shape: {outputs.shape}")
+                    raise ValueError(f"Unexpected output shape: {outputs_denorm.shape}")
 
-                  
-                preds_all.append(preds_single)
-    
+                preds_final_all.append(preds_single)
+
                 # ---- Collect ground truth ----
-                batch_trues = []
-                for y_raw in batch_y_raw:
-                    if y_raw is not None:
-                        batch_trues.append(y_raw.reshape(-1).sum())  # single number
-                if batch_trues:
-                    trues_all.append(np.array(batch_trues))
-    
-        # ---- Concatenate predictions and ground truth ----
-        preds_all = np.concatenate(preds_all, axis=0)  # shape (num_samples,)
-        trues_all = np.concatenate(trues_all, axis=0) if trues_all else np.array([])
-    
-        print(f"[DEBUG] All predictions shape: {preds_all.shape}, All trues shape: {trues_all.shape}")
-    
+                if batch_y_raw is not None:
+                    trues_final_all.append(batch_y_raw.reshape(-1))   # raw scalar
+
+                if batch_y_imfs is not None:
+                    trues_imfs_all.append(batch_y_imfs.reshape(-1, batch_y_imfs.shape[-1]))  # (B, K)
+
+        # ---- Concatenate everything ----
+        preds_final_all = np.concatenate(preds_final_all, axis=0)
+        trues_final_all = np.concatenate(trues_final_all, axis=0) if trues_final_all else np.array([])
+        preds_imfs_all = np.concatenate(preds_imfs_all, axis=0) if preds_imfs_all else np.array([])
+        trues_imfs_all = np.concatenate(trues_imfs_all, axis=0) if trues_imfs_all else np.array([])
+
+        print(f"[DEBUG] pred_final: {preds_final_all.shape}, true_final: {trues_final_all.shape}, "
+              f"pred_imfs: {preds_imfs_all.shape}, true_imfs: {trues_imfs_all.shape}")
+
         # ---- Save outputs ----
-        np.save(os.path.join(pred_folder, 'real_prediction.npy'), preds_all)
-        np.save(os.path.join(pred_folder, 'real_truth.npy'), trues_all)
-    
+        np.save(os.path.join(pred_folder, 'pred_final.npy'), preds_final_all)
+        np.save(os.path.join(pred_folder, 'true_final.npy'), trues_final_all)
+        np.save(os.path.join(pred_folder, 'pred_imfs.npy'), preds_imfs_all)
+        np.save(os.path.join(pred_folder, 'true_imfs.npy'), trues_imfs_all)
+
         logging.info(f"✅ Saved predictions to {pred_folder}")
-    
-        return preds_all, trues_all
+
+        return preds_final_all, trues_final_all, preds_imfs_all, trues_imfs_all

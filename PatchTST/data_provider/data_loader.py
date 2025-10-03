@@ -365,18 +365,16 @@ class Dataset_Pred(Dataset):
             cols.remove(self.target)
             cols.remove('date')
         df_raw = df_raw[['date'] + cols + [self.target]]
-        # store raw ground truth
+        
+        # raw ground truth (unscaled scalar series)
         self.data_raw = df_raw[[self.target]].values
-        border1 = 0
-        border2 = len(df_raw)
 
         if self.use_vmd:
-            # You must define _run_vmd() somewhere
             full_signal = df_raw[self.target].values.astype(float)
             u = _run_vmd(full_signal,
-                         alpha=self.vmd_alpha, tau=self.vmd_tau,
-                         K=self.num_imfs, DC=self.vmd_DC,
-                         init=self.vmd_init, tol=self.vmd_tol)  # (K, N)
+                        alpha=self.vmd_alpha, tau=self.vmd_tau,
+                        K=self.num_imfs, DC=self.vmd_DC,
+                        init=self.vmd_init, tol=self.vmd_tol)  # (K, N)
             imf_cols = [f'imf_{i}' for i in range(self.num_imfs)]
             df_imfs = pd.DataFrame(u.T, columns=imf_cols)
             df_data = df_imfs
@@ -414,6 +412,9 @@ class Dataset_Pred(Dataset):
         else:
             data = df_data.values
 
+        # save IMF-level normalized ground truth
+        self.data_y_imfs = data if self.use_vmd else None
+
         # time features
         df_stamp = pd.DataFrame()
         df_stamp['date'] = pd.to_datetime(df_raw['date'])
@@ -431,22 +432,22 @@ class Dataset_Pred(Dataset):
 
         self.data_x = data
         self.data_stamp = data_stamp
+
     def __getitem__(self, index):
         s_begin = index
         s_end = index + self.seq_len
-    
+
         seq_x = self.data_x[s_begin:s_end]
         seq_x_mark = self.data_stamp[s_begin:s_end]
-    
-        # single ground truth value (next point)
+
         if s_end < len(self.data_x):
-            seq_y_raw = self.data_raw[s_end]  # next point
+            seq_y_raw = self.data_raw[s_end]  # raw target scalar
+            seq_y_imfs = self.data_y_imfs[s_end] if self.use_vmd else  np.zeros((getattr(self, "num_imfs", 1),), dtype=float)
         else:
             seq_y_raw = np.nan
-    
-        return seq_x, seq_x_mark, seq_y_raw
+            seq_y_imfs =  np.zeros((getattr(self, "num_imfs", 1),), dtype=float)
 
-
+        return seq_x, seq_x_mark, seq_y_raw, seq_y_imfs
 
     def __len__(self):
         return len(self.data_x) - self.seq_len + 1

@@ -10,20 +10,21 @@ from PatchTST.layers.PatchTST_layers import series_decomp
 
 # ---------------- ASWL ---------------- #
 class ASWL(nn.Module):
-    """Adaptive Scale-Weighted Layer"""
+    """Adaptive Scale-Weighted Loss (used only during training)"""
     def __init__(self, num_imfs: int):
         super().__init__()
-        # learnable weights for each IMF
         self.weights = nn.Parameter(torch.ones(num_imfs))
 
-    def forward(self, preds: Tensor) -> Tensor:
+    def forward(self, preds: Tensor, targets: Tensor) -> Tensor:
         """
         preds: [B, pred_len, num_imfs]
-        returns: [B, pred_len, 1] (final weighted prediction)
+        targets: [B, pred_len, num_imfs]
+        returns: scalar weighted loss
         """
-        w = torch.softmax(self.weights, dim=0)          # normalize across IMFs
-        weighted = preds * w[None, None, :]             # broadcast multiply
-        return weighted.sum(dim=-1, keepdim=True)       # collapse IMF dimension
+        w = torch.softmax(self.weights, dim=0)                   # normalize weights
+        mse = torch.mean((preds - targets) ** 2, dim=(0, 1))     # IMF-wise MSE
+        loss = torch.sum(w * mse)                                # weighted total
+        return loss
 
 
 # ---------------- Model ---------------- #
@@ -130,33 +131,32 @@ class Model(nn.Module):
                 subtract_last=subtract_last, verbose=verbose, **kwargs
             )
 
-        # --- NEW: attach ASWL if required --- #
+        # --- Attach ASWL if required --- #
         if self.use_vmd and self.use_aswl:
             self.aswl = ASWL(self.num_imfs)
 
-    def forward(self, x: Tensor, x_mark: Optional[Tensor] = None, *args, **kwargs) -> Tensor:
+    def forward(self, x: Tensor, x_mark: Optional[Tensor] = None) -> Tensor:
         """
-        Forward method accepts optional x_mark (time features) and ignores extra args/kwargs.
         x: [B, seq_len, C]  (if use_vmd=True -> C=num_imfs)
+        returns: [B, pred_len, num_imfs] (IMF-wise predictions)
         """
         # --- VMD + ASWL path --- #
-        if self.use_vmd:
-            # Expect x = [B, seq_len, num_imfs]
-            # convert to backbone expected shape [B, C, L] where C=num_imfs
-            x = x.permute(0, 2, 1)        # -> [B, num_imfs, seq_len]
-            preds = self.model(x)         # -> [B, num_imfs, pred_len]
-            preds = preds.permute(0, 2, 1)  # -> [B, pred_len, num_imfs]
+        if self.use_vmd and self.use_aswl:
+            x = x.permute(0, 2, 1)             # [B, num_imfs, seq_len]
+            preds = self.model(x)              # [B, num_imfs, pred_len]
+            preds = preds.permute(0, 2, 1)     # [B, pred_len, num_imfs]
+            return preds                       # all IMF preds (no sum)
 
-            if self.use_aswl:
-                # Weighted sum across IMFs -> final target prediction (still in scaled space)
-                preds = self.aswl(preds)   # -> [B, pred_len, 1]
-            return preds
+        # --- VMD only --- #
+        elif self.use_vmd:
+            x = x.permute(0, 2, 1)
+            preds = self.model(x)
+            preds = preds.permute(0, 2, 1)
+            return preds                       # all IMF preds
 
         # --- Decomposition path --- #
         elif hasattr(self, "decomp_module"):
-            # here x is original series with channels
             res_init, trend_init = self.decomp_module(x)
-            # decomp returns [B, C, L] style, match backbone expectations
             res_init, trend_init = res_init.permute(0, 2, 1), trend_init.permute(0, 2, 1)
             res = self.model_res(res_init)
             trend = self.model_trend(trend_init)
@@ -166,8 +166,7 @@ class Model(nn.Module):
 
         # --- Normal PatchTST --- #
         else:
-            # x: [B, seq_len, C] -> permute to [B, C, L] for backbone
-            x = x.permute(0, 2, 1)  # [B, C, L]
-            x = self.model(x)       # [B, C, pred_len]
-            x = x.permute(0, 2, 1)  # [B, pred_len, C]
-            return x
+            x = x.permute(0, 2, 1)
+            preds = self.model(x)
+            preds = preds.permute(0, 2, 1)
+            return preds

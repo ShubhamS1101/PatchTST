@@ -10,6 +10,17 @@ from PatchTST.utils.time_features import time_features
 import warnings
 warnings.filterwarnings('ignore')
 
+from joblib import load
+import os
+
+def load_imf_scalers(scaler_dir, num_imfs):
+    scalers = {}
+    for i in range(num_imfs):
+        scaler_path = os.path.join(scaler_dir, f"hello{i}.pkl")
+        scalers[i] = load(scaler_path)
+    return scalers
+
+# Example usage
 
 def _run_vmd(signal,
              alpha=2000, tau=0., K=5, DC=0, init=1, tol=1e-7):
@@ -315,6 +326,8 @@ import pandas as pd
 from torch.utils.data import Dataset
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
+
+
 class Dataset_Pred(Dataset):
     def __init__(self, root_path, flag='pred', size=None,
                  features='S', data_path='ETTh1.csv',
@@ -325,7 +338,13 @@ class Dataset_Pred(Dataset):
         """
         Prediction dataset with sliding windows.
         Produces all windows of length seq_len for inference.
+        Now supports leakage-free VMD per window when use_vmd=True.
         """
+
+        scaler_dir = "/content/results/experiment_PatchTST_ftS_sl96_ll48_pl1_dm128_nh16_el3_df256_VMD15_0"
+        num_imfs = 10
+        external_scalers = load_imf_scalers(scaler_dir, num_imfs)
+
         if size is None:
             self.seq_len = 96   # default sequence length
         else:
@@ -348,7 +367,7 @@ class Dataset_Pred(Dataset):
         self.vmd_DC = vmd_DC
         self.vmd_init = vmd_init
         self.vmd_tol = vmd_tol
-        self.external_scalers = scalers  # expected dict for vmd, or scaler object for non-vmd
+        self.external_scalers = external_scalers  # expected dict for vmd, or scaler object for non-vmd
 
         self.root_path = root_path
         self.data_path = data_path
@@ -367,53 +386,8 @@ class Dataset_Pred(Dataset):
         df_raw = df_raw[['date'] + cols + [self.target]]
         
         # raw ground truth (unscaled scalar series)
-        self.data_raw = df_raw[[self.target]].values
-
-        if self.use_vmd:
-            full_signal = df_raw[self.target].values.astype(float)
-            u = _run_vmd(full_signal,
-                        alpha=self.vmd_alpha, tau=self.vmd_tau,
-                        K=self.num_imfs, DC=self.vmd_DC,
-                        init=self.vmd_init, tol=self.vmd_tol)  # (K, N)
-            imf_cols = [f'imf_{i}' for i in range(self.num_imfs)]
-            df_imfs = pd.DataFrame(u.T, columns=imf_cols)
-            df_data = df_imfs
-        else:
-            if self.features == 'M' or self.features == 'MS':
-                cols_data = df_raw.columns[1:]
-                df_data = df_raw[cols_data]
-            elif self.features == 'S':
-                df_data = df_raw[[self.target]]
-
-        # scaling
-        if self.scale:
-            if self.use_vmd:
-                imf_cols = df_data.columns.tolist()
-                if self.external_scalers is None:
-                    self.scalers = {}
-                    for i, col in enumerate(imf_cols):
-                        sc = MinMaxScaler(feature_range=(0, 1)) if self.scaler_type == 'minmax' else StandardScaler()
-                        sc.fit(df_data[[col]].values)
-                        self.scalers[i] = sc
-                else:
-                    self.scalers = self.external_scalers
-
-                data_scaled = np.zeros_like(df_data.values, dtype=float)
-                for i, col in enumerate(imf_cols):
-                    data_scaled[:, i] = self.scalers[i].transform(df_data[[col]].values).reshape(-1)
-                data = data_scaled
-            else:
-                if self.external_scalers is not None and isinstance(self.external_scalers, (StandardScaler, MinMaxScaler)):
-                    self.scaler = self.external_scalers
-                else:
-                    self.scaler = MinMaxScaler(feature_range=(0, 1)) if self.scaler_type == 'minmax' else StandardScaler()
-                    self.scaler.fit(df_data.values)
-                data = self.scaler.transform(df_data.values)
-        else:
-            data = df_data.values
-
-        # save IMF-level normalized ground truth
-        self.data_y_imfs = data if self.use_vmd else None
+        self.data_raw = df_raw[[self.target]].values.astype(float)
+        self.df_raw = df_raw
 
         # time features
         df_stamp = pd.DataFrame()
@@ -430,27 +404,80 @@ class Dataset_Pred(Dataset):
             data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
             data_stamp = data_stamp.transpose(1, 0)
 
-        self.data_x = data
         self.data_stamp = data_stamp
 
-    def __getitem__(self, index):
-        s_begin = index
-        s_end = index + self.seq_len
+        # For non-VMD, precompute scaled data for all windows
+        if not self.use_vmd:
+            if self.features == 'M' or self.features == 'MS':
+                cols_data = df_raw.columns[1:]
+                df_data = df_raw[cols_data]
+            elif self.features == 'S':
+                df_data = df_raw[[self.target]]
 
-        seq_x = self.data_x[s_begin:s_end]
-        seq_x_mark = self.data_stamp[s_begin:s_end]
+            if self.scale:
+                if self.external_scalers is not None and isinstance(self.external_scalers, (StandardScaler, MinMaxScaler)):
+                    self.scaler = self.external_scalers
+                else:
+                    self.scaler = MinMaxScaler(feature_range=(0, 1)) if self.scaler_type == 'minmax' else StandardScaler()
+                    self.scaler.fit(df_data.values)
+                data = self.scaler.transform(df_data.values)
+            else:
+                data = df_data.values
 
-        if s_end < len(self.data_x):
-            seq_y_raw = self.data_raw[s_end]  # raw target scalar
-            seq_y_imfs = self.data_y_imfs[s_end] if self.use_vmd else  np.zeros((getattr(self, "num_imfs", 1),), dtype=float)
+            self.data_x = data
+
+        # For VMD, IMFs are computed per window in __getitem__ (leakage-free)
         else:
-            seq_y_raw = np.nan
-            seq_y_imfs =  np.zeros((getattr(self, "num_imfs", 1),), dtype=float)
+            self.scalers = self.external_scalers  # must be provided (fit on train set)
+            # self.data_raw already set above
 
-        return seq_x, seq_x_mark, seq_y_raw, seq_y_imfs
+    def __getitem__(self, index):
+        # For non-VMD, just slice precomputed scaled data
+        if not self.use_vmd:
+            s_begin = index
+            s_end = index + self.seq_len
+
+            seq_x = self.data_x[s_begin:s_end]
+            seq_x_mark = self.data_stamp[s_begin:s_end]
+
+            if s_end < len(self.data_x):
+                seq_y_raw = self.data_raw[s_end]  # raw target scalar
+                seq_y_imfs = np.zeros((getattr(self, "num_imfs", 1),), dtype=float)
+            else:
+                seq_y_raw = np.nan
+                seq_y_imfs = np.zeros((getattr(self, "num_imfs", 1),), dtype=float)
+
+            return seq_x, seq_x_mark, seq_y_raw, seq_y_imfs
+
+        # VMD: compute IMFs per window (leakage-free)
+        else:
+            window = self.data_raw[index : index + self.seq_len].flatten()
+            if len(window) < self.seq_len:
+                pad = np.zeros(self.seq_len - len(window))
+                window = np.concatenate([window, pad])
+
+            # Run VMD on the window only (no future data)
+            imfs = _run_vmd(window, alpha=self.vmd_alpha, tau=self.vmd_tau, K=self.num_imfs,
+                            DC=self.vmd_DC, init=self.vmd_init, tol=self.vmd_tol)  # shape (K, seq_len)
+
+            # Scale IMFs using external scalers (fit on training set)
+            if self.scale and self.scalers is not None:
+                imfs_scaled = np.zeros((self.seq_len, self.num_imfs), dtype=float)
+                for i in range(self.num_imfs):
+                    imfs_scaled[:, i] = self.scalers[i].transform(imfs[i].reshape(-1, 1)).reshape(-1)
+            else:
+                print("External Scalers not found")
+                imfs_scaled = imfs.T  # shape (seq_len, num_imfs)
+
+            seq_x = imfs_scaled  # shape (seq_len, num_imfs)
+            seq_x_mark = self.data_stamp[index : index + self.seq_len]
+            seq_y_raw = self.data_raw[index + self.seq_len][0] if (index + self.seq_len) < len(self.data_raw) else np.nan
+            seq_y_imfs = np.zeros((self.num_imfs,), dtype=float)  # Not used for prediction
+
+            return seq_x, seq_x_mark, seq_y_raw, seq_y_imfs
 
     def __len__(self):
-        return len(self.data_x) - self.seq_len + 1
+        return len(self.data_raw) - self.seq_len
 
     # ==== Transform helpers ====
     def inverse_transform(self, data):
@@ -464,22 +491,20 @@ class Dataset_Pred(Dataset):
     def inverse_transform_imfs(self, imf_preds):
         """
         Inverse scaling and recombine IMFs to reconstruct original signal.
+        imf_preds: shape (seq_len, num_imfs) or (B, seq_len, num_imfs)
         """
-        if not self.use_vmd:
-            return self.inverse_transform(imf_preds)
-
+        if not self.use_vmd or self.scalers is None:
+            return imf_preds.sum(axis=-1)
         K = self.num_imfs
         arr = np.asarray(imf_preds)
-
-        if arr.ndim == 2 and arr.shape[1] == K:  # (T, K)
+        if arr.ndim == 2 and arr.shape[1] == K:  # (seq_len, K)
             out = np.zeros(arr.shape[0])
             for i in range(K):
                 sc = self.scalers[i]
                 inv_col = sc.inverse_transform(arr[:, i].reshape(-1, 1)).reshape(-1)
                 out += inv_col
             return out
-
-        elif arr.ndim == 3:  # (B, T, K)
+        elif arr.ndim == 3:  # (B, seq_len, K)
             B, T, K_ = arr.shape
             out = np.zeros((B, T))
             for b in range(B):

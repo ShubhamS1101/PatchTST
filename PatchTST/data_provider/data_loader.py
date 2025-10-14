@@ -136,7 +136,7 @@ class Dataset_Custom(Dataset):
 
         # ---- STEP 4: Prepare tensors ----
         seq_x = torch.tensor(imfs_in, dtype=torch.float).T                     # (num_imfs, seq_len)
-        seq_y = torch.tensor(imfs_out[:, -self.pred_len:], dtype=torch.float).T                    # (num_imfs, label_len + pred_len)
+        seq_y = torch.tensor(imfs_out, dtype=torch.float).T                    # (num_imfs, label_len + pred_len)
         seq_x_mark = torch.tensor(self.data_stamp[s_begin:s_end], dtype=torch.float)
         seq_y_mark = torch.tensor(self.data_stamp[r_begin:r_end], dtype=torch.float)
 

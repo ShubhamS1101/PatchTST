@@ -62,7 +62,7 @@ def parse_args():
     parser.add_argument('--padding_patch', type=str, default='end', help='patch padding method')
 
     # Training / optimization
-    parser.add_argument('--device_ids', type=str, default='0', help='comma-separated GPU ids')
+    parser.add_argument('--device_ids', type=int, default=[0], nargs = '+', help='comma-separated GPU ids')
     parser.add_argument('--use_gpu', type=bool, default=True, help='use GPU if available')
     parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple GPUs')
     parser.add_argument('--train_epochs', type=int, default=10, help='epochs')

@@ -351,17 +351,17 @@ class Exp_Main(object):
         self.model.eval()
         with torch.no_grad():
             for i, (batch_x, batch_x_mark, batch_y_raw, batch_y_imfs) in enumerate(predict_loader):
-
+        
                 batch_x = batch_x.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
-
+        
                 # ---- Forward pass ----
                 outputs = self.model(batch_x, batch_x_mark)   # [B, pred_len, K]
                 outputs = outputs[:, -self.args.pred_len:, :] # keep last pred_len
-
-                # ---- Store normalized IMF predictions ----
-                preds_imfs_all.append(outputs[:, -1, :].detach().cpu().numpy())  # (B, K)
-
+        
+                # ---- Store normalized IMF predictions (use only first predicted step) ----
+                preds_imfs_all.append(outputs[:, 0, :].detach().cpu().numpy())  # (B, K) <-- CHANGED
+        
                 # ---- Inverse transform for reconstruction ----
                 if getattr(self.args, "use_vmd", False):
                     outputs_denorm = predict_data.inverse_transform(outputs.detach().cpu().numpy())
@@ -372,21 +372,21 @@ class Exp_Main(object):
                         outputs_denorm = inv.reshape(outputs.shape)
                     else:
                         outputs_denorm = outputs.detach().cpu().numpy()
-
-                # ---- Collapse to final scalar prediction ----
+        
+                # ---- Collapse to final scalar prediction (use only first step) ----
                 if outputs_denorm.ndim == 3:   # (B, T, K)
-                    preds_single = outputs_denorm[:, -1, :].sum(axis=-1)  # (B,)
+                    preds_single = outputs_denorm[:, 0, :].sum(axis=-1)  # (B,) <-- CHANGED
                 elif outputs_denorm.ndim == 2: # (B, K)
-                    preds_single = outputs_denorm.sum(axis=-1)            # (B,)
+                    preds_single = outputs_denorm.sum(axis=-1)           # (B,)
                 else:
                     raise ValueError(f"Unexpected output shape: {outputs_denorm.shape}")
-
+        
                 preds_final_all.append(preds_single)
-
+        
                 # ---- Collect ground truth ----
                 if batch_y_raw is not None:
                     trues_final_all.append(batch_y_raw.reshape(-1))   # raw scalar
-
+        
                 if batch_y_imfs is not None:
                     trues_imfs_all.append(batch_y_imfs.reshape(-1, batch_y_imfs.shape[-1]))  # (B, K)
 

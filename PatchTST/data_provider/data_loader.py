@@ -111,7 +111,7 @@ class Dataset_Custom(Dataset):
 
         # Input and output segments from raw data
         window_in = self.raw_signal[s_begin:s_end]            # for encoder
-        window_out = self.raw_signal[s_begin:r_end]           # for decoder
+        window_out = self.raw_signal[r_begin:r_end]           # for decoder
 
         # ---- STEP 2: Decompose using VMD ----
         imfs_in = _run_vmd(window_in,
@@ -136,9 +136,9 @@ class Dataset_Custom(Dataset):
 
         # ---- STEP 4: Prepare tensors ----
         seq_x = torch.tensor(imfs_in, dtype=torch.float).T                     # (num_imfs, seq_len)
-        seq_y = torch.tensor(imfs_out, dtype=torch.float).T                    # (num_imfs, label_len + pred_len)
+        seq_y = torch.tensor(imfs_out[:, -self.pred_len:], dtype=torch.float).T                    # (num_imfs, label_len + pred_len)
         seq_x_mark = torch.tensor(self.data_stamp[s_begin:s_end], dtype=torch.float)
-        seq_y_mark = torch.tensor(self.data_stamp[r_begin:r_end], dtype=torch.float)
+        seq_y_mark = torch.tensor(self.data_stamp[s_end:r_end], dtype=torch.float)
 
         return seq_x, seq_y, seq_x_mark, seq_y_mark
 
@@ -393,7 +393,7 @@ class Dataset_Pred(Dataset):
             return seq_x, seq_x_mark, seq_y_raw, seq_y_imfs
 
     def __len__(self):
-        return len(self.data_raw) - self.seq_len
+        return len(self.data_raw) - self.seq_len + 1
 
     # ==== Transform helpers ====
     def inverse_transform(self, data):

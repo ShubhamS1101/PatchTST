@@ -1,34 +1,38 @@
-import os
-import time
+from PatchTST.data_provider.data_factory import data_provider
+from PatchTST.model.trend_loss import trend_loss
+from .Exp_basic import Exp_Basic
+from PatchTST.utils.tools import EarlyStopping, adjust_learning_rate, visual, test_params_flop
+from PatchTST.utils.metrics import metric
+import joblib
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from torch import optim
 from torch.optim import lr_scheduler
-import joblib
 
-from PatchTST.model.Patch import Model
-from PatchTST.model.trend_loss import trend_loss  # <-- Import your new loss
+import os
+import time
+import warnings
+import logging
 
-from PatchTST.utils.tools import EarlyStopping, adjust_learning_rate, visual, metric, test_params_flop
-from PatchTST.data.data_loader import data_provider
+from PatchTST.model import Patch
 
-class Exp_Main(object):
+warnings.filterwarnings('ignore')
+
+
+class Exp_Main(Exp_Basic):
     def __init__(self, args):
         super(Exp_Main, self).__init__(args)
-        self.args = args
-        self.device = torch.device('cuda' if torch.cuda.is_available() and args.use_gpu else 'cpu')
-        self.model = None
+        # placeholders for scalers that will be set during train or loaded in predict
         self.scaler = None       # single scaler (non-vmd)
         self.scalers = None      # dict/list of per-imf scalers (vmd)
-
+    
     def _build_model(self):
         """Build the PatchTST model (and wrap for multi-gpu if requested)."""
-        model = Model(self.args).float()
+        model = Patch.Model(self.args).float()
         if getattr(self.args, "use_multi_gpu", False) and getattr(self.args, "use_gpu", False):
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
-        self.model = model.to(self.device)
-        return self.model
+        return model
 
     def _get_data(self, flag):
         """
@@ -48,8 +52,8 @@ class Exp_Main(object):
         return model_optim
 
     def _select_criterion(self):
-        # Use the custom trend-aware loss
-        return trend_loss
+        criterion = trend_loss
+        return criterion
 
     def _align_outputs_and_targets(self, outputs, batch_y):
         """
@@ -93,13 +97,16 @@ class Exp_Main(object):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
 
-                outputs = self.model(batch_x)
+                if getattr(self.args, "use_amp", False):
+                    with torch.cuda.amp.autocast():
+                        outputs = self.model(batch_x)
+                else:
+                    outputs = self.model(batch_x)
+
                 outputs = outputs[:, -self.args.pred_len:, :]
                 batch_y_window = batch_y[:, -self.args.pred_len:, :]
 
                 outputs_aligned, target_aligned = self._align_outputs_and_targets(outputs, batch_y_window)
-
-                # === Trend Loss Integration ===
                 if outputs_aligned.shape[1] > 1:
                     pred = outputs_aligned[:, 1:, :]
                     true = target_aligned[:, 1:, :]
@@ -114,17 +121,19 @@ class Exp_Main(object):
                 # =============================
 
                 total_loss.append(loss.item())
-
         total_loss = np.average(total_loss) if len(total_loss) > 0 else 0.0
         self.model.train()
         return total_loss
 
     def train(self, setting):
+        # get data and scalers for train/val/test
         train_data, train_loader, train_scaler = self._get_data(flag='train')
         vali_data, vali_loader, _ = self._get_data(flag='val')
         test_data, test_loader, _ = self._get_data(flag='test')
 
+        # store scalers from training dataset for later inverse transform/save
         if getattr(self.args, "use_vmd", False):
+            # train_scaler expected to be a dict/list of per-imf scalers
             self.scalers = train_scaler
         else:
             self.scaler = train_scaler
@@ -165,24 +174,30 @@ class Exp_Main(object):
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
 
-                outputs = self.model(batch_x)
-                outputs = outputs[:, -self.args.pred_len:, :]
-                batch_y_window = batch_y[:, -self.args.pred_len:, :]
-                outputs_aligned, target_aligned = self._align_outputs_and_targets(outputs, batch_y_window)
-
-                # === Trend Loss Integration ===
-                if outputs_aligned.shape[1] > 1:
-                    pred = outputs_aligned[:, 1:, :]
-                    true = target_aligned[:, 1:, :]
-                    prev_pred = outputs_aligned[:, :-1, :]
-                    prev_true = target_aligned[:, :-1, :]
-                    loss = criterion(pred, true, prev_pred, prev_true, alpha=0.2)
+                if amp_scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        outputs = self.model(batch_x)
+                        outputs = outputs[:, -self.args.pred_len:, :]
+                        batch_y_window = batch_y[:, -self.args.pred_len:, :]
+                        outputs_aligned, target_aligned = self._align_outputs_and_targets(outputs, batch_y_window)
+                        loss = criterion(outputs_aligned.to(self.device), target_aligned.to(self.device))
                 else:
-                    # pred_len == 1 case
-                    prev_true = batch_x[:, -1:, :]
-                    prev_pred = outputs_aligned.detach()
-                    loss = criterion(outputs_aligned, target_aligned, prev_pred, prev_true, alpha=0.2)
-                # =============================
+                    outputs = self.model(batch_x)
+                    outputs = outputs[:, -self.args.pred_len:, :]
+                    batch_y_window = batch_y[:, -self.args.pred_len:, :]
+                    outputs_aligned, target_aligned = self._align_outputs_and_targets(outputs, batch_y_window)
+                    if outputs_aligned.shape[1] > 1:
+                        pred = outputs_aligned[:, 1:, :]
+                        true = target_aligned[:, 1:, :]
+                        prev_pred = outputs_aligned[:, :-1, :]
+                        prev_true = target_aligned[:, :-1, :]
+                        loss = criterion(pred, true, prev_pred, prev_true, alpha=0.2)
+                    else:
+                        # pred_len == 1 case
+                        prev_true = batch_x[:, -1:, :]
+                        prev_pred = outputs_aligned.detach()
+                        loss = criterion(outputs_aligned, target_aligned, prev_pred, prev_true, alpha=0.2)
+                    # =============================
 
                 train_loss.append(loss.item())
 
@@ -351,17 +366,17 @@ class Exp_Main(object):
         self.model.eval()
         with torch.no_grad():
             for i, (batch_x, batch_x_mark, batch_y_raw, batch_y_imfs) in enumerate(predict_loader):
-        
+
                 batch_x = batch_x.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
-        
+
                 # ---- Forward pass ----
                 outputs = self.model(batch_x, batch_x_mark)   # [B, pred_len, K]
                 outputs = outputs[:, -self.args.pred_len:, :] # keep last pred_len
-        
-                # ---- Store normalized IMF predictions (use only first predicted step) ----
-                preds_imfs_all.append(outputs[:, 0, :].detach().cpu().numpy())  # (B, K) <-- CHANGED
-        
+
+                # ---- Store normalized IMF predictions ----
+                preds_imfs_all.append(outputs[:, -1, :].detach().cpu().numpy())  # (B, K)
+
                 # ---- Inverse transform for reconstruction ----
                 if getattr(self.args, "use_vmd", False):
                     outputs_denorm = predict_data.inverse_transform(outputs.detach().cpu().numpy())
@@ -372,21 +387,21 @@ class Exp_Main(object):
                         outputs_denorm = inv.reshape(outputs.shape)
                     else:
                         outputs_denorm = outputs.detach().cpu().numpy()
-        
-                # ---- Collapse to final scalar prediction (use only first step) ----
+
+                # ---- Collapse to final scalar prediction ----
                 if outputs_denorm.ndim == 3:   # (B, T, K)
-                    preds_single = outputs_denorm[:, 0, :].sum(axis=-1)  # (B,) <-- CHANGED
+                    preds_single = outputs_denorm[:, -1, :].sum(axis=-1)  # (B,)
                 elif outputs_denorm.ndim == 2: # (B, K)
-                    preds_single = outputs_denorm.sum(axis=-1)           # (B,)
+                    preds_single = outputs_denorm.sum(axis=-1)            # (B,)
                 else:
                     raise ValueError(f"Unexpected output shape: {outputs_denorm.shape}")
-        
+
                 preds_final_all.append(preds_single)
-        
+
                 # ---- Collect ground truth ----
                 if batch_y_raw is not None:
                     trues_final_all.append(batch_y_raw.reshape(-1))   # raw scalar
-        
+
                 if batch_y_imfs is not None:
                     trues_imfs_all.append(batch_y_imfs.reshape(-1, batch_y_imfs.shape[-1]))  # (B, K)
 

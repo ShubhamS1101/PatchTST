@@ -83,6 +83,7 @@ def parse_args():
     parser.add_argument('--use_aswl', action='store_true', help='use Adaptive Scale-Weighted Layer (ASWL/AWSL)')
 
     # Flow control
+    parser.add_argument('--resume', action='store_true', help='whether to resume or not')
     parser.add_argument('--do_train', action='store_true', help='whether to train')
     parser.add_argument('--do_test', action='store_true', help='whether to test')
     parser.add_argument('--do_predict', action='store_true', help='whether to predict')
@@ -183,7 +184,11 @@ def main():
         setting = build_setting_string(args, ii)
         if args.do_train:
             logging.info(">>>>>>> Training: %s", setting)
-            exp.train(setting)
+            if args.resume:
+
+              exp.train(setting, resume = True)
+            else:
+              exp.train(setting, resume = False)
 
         if args.do_test:
             logging.info(">>>>>>> Testing: %s", setting)

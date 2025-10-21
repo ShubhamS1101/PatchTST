@@ -21,24 +21,19 @@ warnings.filterwarnings('ignore')
 
 
 class Exp_Main(Exp_Basic):
-    def __init__(self, args):
-        super(Exp_Main, self).__init__(args)
-        # placeholders for scalers that will be set during train or loaded in predict
-        self.scaler = None       # single scaler (non-vmd)
-        self.scalers = None      # dict/list of per-imf scalers (vmd)
+    def init(self, args):
+        super(Exp_Main, self).init(args)
+        self.scaler = None
+        self.scalers = None
+        self.model = self._build_model().to(self.device) # ensure model built on init     # dict/list of per-imf scalers (vmd)
     
     def _build_model(self):
-        """Build the PatchTST model (and wrap for multi-gpu if requested)."""
         model = Patch.Model(self.args).float()
         if getattr(self.args, "use_multi_gpu", False) and getattr(self.args, "use_gpu", False):
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
         return model
 
     def _get_data(self, flag):
-        """
-        Return dataset, dataloader, scaler.
-        scaler will be None if data_provider didn't return one.
-        """
         result = data_provider(self.args, flag)
         if len(result) == 3:
             data_set, data_loader, scaler = result
@@ -48,17 +43,36 @@ class Exp_Main(Exp_Basic):
         return data_set, data_loader, scaler
 
     def _select_optimizer(self):
-        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-        return model_optim
+        return optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
 
     def _select_criterion(self):
-        criterion = trend_loss
-        return criterion
+        return trend_loss
+
+    # === added/resume ===
+    def _resume_checkpoint(self, setting):
+        """Load checkpoint if available (prefers full, else weights-only)."""
+        path_dir = os.path.join(self.args.checkpoints, setting)
+        path_dir = '/content/PatchTST/PatchTST/checkpoints/experiment_PatchTST_ftS_sl96_ll96_pl1_dm256_nh16_el5_df256_VMD8_ASWL_0/'
+        full_path = os.path.join(path_dir, "checkpoint_full.pth")
+        best_path = os.path.join(path_dir, "checkpoint.pth")
+
+        print(best_path)
+
+        if os.path.exists(full_path):
+            print(f"🔄 Resuming full checkpoint from {full_path}")
+            checkpoint = torch.load(full_path, map_location=self.device)
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+            self._loaded_optimizer_state = checkpoint.get("optimizer_state_dict", None)
+            print("✅ Model + optimizer state loaded successfully.")
+        elif os.path.exists(best_path):
+            print(f"🔄 Resuming from best weights (no optimizer): {best_path}")
+            self.model.load_state_dict(torch.load(best_path, map_location=self.device))
+            self._loaded_optimizer_state = None
+        else:
+            print("[Info] No checkpoint found to resume from.")
+            self._loaded_optimizer_state = None
 
     def _align_outputs_and_targets(self, outputs, batch_y):
-        """
-        Align shapes between outputs and batch_y.
-        """
         if not torch.is_tensor(outputs):
             outputs = torch.tensor(outputs)
         if not torch.is_tensor(batch_y):
@@ -114,52 +128,53 @@ class Exp_Main(Exp_Basic):
                     prev_true = target_aligned[:, :-1, :]
                     loss = criterion(pred, true, prev_pred, prev_true, alpha=0.2)
                 else:
-                    # pred_len == 1 case
                     prev_true = batch_x[:, -1:, :]
                     prev_pred = outputs_aligned.detach()
                     loss = criterion(outputs_aligned, target_aligned, prev_pred, prev_true, alpha=0.2)
-                # =============================
-
                 total_loss.append(loss.item())
         total_loss = np.average(total_loss) if len(total_loss) > 0 else 0.0
         self.model.train()
         return total_loss
 
-    def train(self, setting):
-        # get data and scalers for train/val/test
-        train_data, train_loader, train_scaler = self._get_data(flag='train')
-        vali_data, vali_loader, _ = self._get_data(flag='val')
-        test_data, test_loader, _ = self._get_data(flag='test')
+    def train(self, setting, resume=False):
+        train_data, train_loader, train_scaler = self._get_data(flag="train")
+        vali_data, vali_loader, _ = self._get_data(flag="val")
+        test_data, test_loader, _ = self._get_data(flag="test")
 
-        # store scalers from training dataset for later inverse transform/save
         if getattr(self.args, "use_vmd", False):
-            # train_scaler expected to be a dict/list of per-imf scalers
             self.scalers = train_scaler
         else:
             self.scaler = train_scaler
 
         path = os.path.join(self.args.checkpoints, setting)
-        if not os.path.exists(path):
-            os.makedirs(path)
+        os.makedirs(path, exist_ok=True)
 
-        time_now = time.time()
-        train_steps = len(train_loader)
-        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
+        # === resume checkpoint logic ===
+        if resume:
+            self._resume_checkpoint(setting)
 
         model_optim = self._select_optimizer()
-        criterion = self._select_criterion()
+        if getattr(self, "_loaded_optimizer_state", None) is not None:
+            try:
+                model_optim.load_state_dict(self._loaded_optimizer_state)
+                print("✅ Optimizer state resumed.")
+            except Exception as e:
+                print(f"[Warning] Could not load optimizer state: {e}")
 
-        amp_scaler = None
-        if getattr(self.args, "use_amp", False):
-            amp_scaler = torch.cuda.amp.GradScaler()
+        criterion = self._select_criterion()
+        amp_scaler = torch.cuda.amp.GradScaler() if getattr(self.args, "use_amp", False) else None
 
         scheduler = lr_scheduler.OneCycleLR(
             optimizer=model_optim,
-            steps_per_epoch=max(1, train_steps),
+            steps_per_epoch=max(1, len(train_loader)),
             pct_start=getattr(self.args, "pct_start", 0.3),
             epochs=max(1, self.args.train_epochs),
-            max_lr=self.args.learning_rate
+            max_lr=self.args.learning_rate,
         )
+
+        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
+
+        print(f"🚀 Starting training for {self.args.train_epochs} epochs...")
 
         for epoch in range(self.args.train_epochs):
             iter_count = 0
@@ -170,44 +185,26 @@ class Exp_Main(Exp_Basic):
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
                 iter_count += 1
                 model_optim.zero_grad()
-
                 batch_x = batch_x.float().to(self.device)
                 batch_y = batch_y.float().to(self.device)
 
-                if amp_scaler is not None:
-                    with torch.cuda.amp.autocast():
-                        outputs = self.model(batch_x)
-                        outputs = outputs[:, -self.args.pred_len:, :]
-                        batch_y_window = batch_y[:, -self.args.pred_len:, :]
-                        outputs_aligned, target_aligned = self._align_outputs_and_targets(outputs, batch_y_window)
-                        loss = criterion(outputs_aligned.to(self.device), target_aligned.to(self.device))
+                outputs = self.model(batch_x)
+                outputs = outputs[:, -self.args.pred_len:, :]
+                batch_y_window = batch_y[:, -self.args.pred_len:, :]
+                outputs_aligned, target_aligned = self._align_outputs_and_targets(outputs, batch_y_window)
+
+                if outputs_aligned.shape[1] > 1:
+                    pred = outputs_aligned[:, 1:, :]
+                    true = target_aligned[:, 1:, :]
+                    prev_pred = outputs_aligned[:, :-1, :]
+                    prev_true = target_aligned[:, :-1, :]
+                    loss = criterion(pred, true, prev_pred, prev_true, alpha=0.2)
                 else:
-                    outputs = self.model(batch_x)
-                    outputs = outputs[:, -self.args.pred_len:, :]
-                    batch_y_window = batch_y[:, -self.args.pred_len:, :]
-                    outputs_aligned, target_aligned = self._align_outputs_and_targets(outputs, batch_y_window)
-                    if outputs_aligned.shape[1] > 1:
-                        pred = outputs_aligned[:, 1:, :]
-                        true = target_aligned[:, 1:, :]
-                        prev_pred = outputs_aligned[:, :-1, :]
-                        prev_true = target_aligned[:, :-1, :]
-                        loss = criterion(pred, true, prev_pred, prev_true, alpha=0.2)
-                    else:
-                        # pred_len == 1 case
-                        prev_true = batch_x[:, -1:, :]
-                        prev_pred = outputs_aligned.detach()
-                        loss = criterion(outputs_aligned, target_aligned, prev_pred, prev_true, alpha=0.2)
-                    # =============================
+                    prev_true = batch_x[:, -1:, :]
+                    prev_pred = outputs_aligned.detach()
+                    loss = criterion(outputs_aligned, target_aligned, prev_pred, prev_true, alpha=0.2)
 
                 train_loss.append(loss.item())
-
-                if (i + 1) % 100 == 0:
-                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
-                    speed = (time.time() - time_now) / (iter_count if iter_count > 0 else 1)
-                    left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
-                    print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
-                    iter_count = 0
-                    time_now = time.time()
 
                 if amp_scaler is not None:
                     amp_scaler.scale(loss).backward()
@@ -217,47 +214,48 @@ class Exp_Main(Exp_Basic):
                     loss.backward()
                     model_optim.step()
 
-                if getattr(self.args, "lradj", "TST") == 'TST':
+                if getattr(self.args, "lradj", "TST") == "TST":
                     adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
                     scheduler.step()
 
-            print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+                if (i + 1) % 100 == 0:
+                    print(f"\titers: {i+1}, epoch: {epoch+1} | loss: {loss.item():.7f}")
+
+            print(f"Epoch: {epoch + 1} cost time: {time.time() - epoch_time:.2f}s")
             train_loss_avg = np.average(train_loss) if len(train_loss) > 0 else 0.0
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
+            print(f"Epoch: {epoch+1} | Train: {train_loss_avg:.6f}, Val: {vali_loss:.6f}, Test: {test_loss:.6f}")
 
-            print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
-                epoch + 1, train_steps, train_loss_avg, vali_loss, test_loss))
             early_stopping(vali_loss, self.model, path)
             if early_stopping.early_stop:
-                print("Early stopping")
+                print("Early stopping triggered.")
                 break
 
-            if getattr(self.args, "lradj", "TST") != 'TST':
+            if getattr(self.args, "lradj", "TST") != "TST":
                 adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args)
             else:
-                print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
+                print(f"Updating learning rate to {scheduler.get_last_lr()[0]:.6f}")
 
-        # load best checkpoint (EarlyStopping wrote it to path)
-        best_model_path = os.path.join(path, 'checkpoint.pth')
+            torch.save({
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": model_optim.state_dict(),
+            }, os.path.join(path, "checkpoint_full.pth"))
+
+        best_model_path = os.path.join(path, "checkpoint.pth")
         if os.path.exists(best_model_path):
             self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
+            print(f"✅ Loaded best model from {best_model_path}")
         else:
-            print(f"[Warning] Best model checkpoint not found at {best_model_path}. Skipping load.")
+            print("[Warning] Best model checkpoint not found.")
 
-        # ------------------ SAVE SCALERS ------------------
-        # Save scalers so predict() can load them later. Save under ./results/<setting>/
-        save_dir = os.path.join('./results', setting)
+        save_dir = os.path.join("./results", setting)
         os.makedirs(save_dir, exist_ok=True)
 
         try:
             if getattr(self.args, "use_vmd", False) and (self.scalers is not None):
-                # assume self.scalers is a dict or list-like of fitted scaler objects
                 for i, sc in enumerate(self.scalers):
                     joblib.dump(sc, os.path.join(save_dir, f"scaler_imf{i}.pkl"))
-                for i in range(len(self.scalers)):
-                    joblib.dump(self.scalers[i], os.path.join(save_dir, f"hello{i}.pkl"))
-                    print(type(self.scalers[i]))
                 print(f"✅ Saved {len(self.scalers)} IMF scalers to {save_dir}")
             elif self.scaler is not None:
                 joblib.dump(self.scaler, os.path.join(save_dir, "scaler.pkl"))
